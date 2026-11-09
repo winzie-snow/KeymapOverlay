@@ -95,10 +95,23 @@ class OverlayService : Service() {
         private val bg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x553A5AFF; style = Paint.Style.FILL }
         private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF9FB4FF.toInt(); style = Paint.Style.STROKE; strokeWidth = 4f }
         private val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF5C6BC0.toInt(); style = Paint.Style.FILL }
+        private val xhOutline = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xAA000000.toInt(); style = Paint.Style.STROKE; strokeWidth = 7f; strokeCap = Paint.Cap.ROUND }
+        private val xhLine = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = 3f; strokeCap = Paint.Cap.ROUND }
+        // locked (playing): draw only a crosshair, no blue circle. Edit mode keeps the full circle so it can be grabbed.
+        var crosshairOnly = false
+            set(v) { if (field != v) { field = v; invalidate() } }
         override fun onDraw(canvas: Canvas) {
             val cx = width / 2f
             val cy = height / 2f
             val r = minOf(cx, cy) - 4f
+            if (crosshairOnly) {
+                val a = r * 0.7f
+                canvas.drawLine(cx - a, cy, cx + a, cy, xhOutline)
+                canvas.drawLine(cx, cy - a, cx, cy + a, xhOutline)
+                canvas.drawLine(cx - a, cy, cx + a, cy, xhLine)
+                canvas.drawLine(cx, cy - a, cx, cy + a, xhLine)
+                return
+            }
             canvas.drawCircle(cx, cy, r, bg)
             canvas.drawCircle(cx, cy, r, ring)
             canvas.drawLine(cx - r, cy, cx + r, cy, ring)
@@ -308,9 +321,20 @@ class OverlayService : Service() {
         mk.view.alpha = mk.alpha
         wm.updateViewLayout(mk.view, mk.lp)
         mk.rangeView?.alpha = if (locked) mk.alpha * 0.4f else mk.alpha
+        (mk.view as? AimView)?.crosshairOnly = locked
+        if (mk.type == "aim") {
+            // while playing, keep every aim window at <= 0.75 window opacity: Android 12+ blocks touches that
+            // would pass through a more opaque overlay window, which can swallow the camera finger
+            val wa = if (locked) 0.75f else 1f
+            mk.lp.alpha = wa
+            wm.updateViewLayout(mk.view, mk.lp)
+            val rv = mk.rangeView; val rl = mk.rangeLp
+            if (rv != null && rl != null) { rl.alpha = wa; wm.updateViewLayout(rv, rl) }
+        }
         mk.grip?.let { g ->
             val gl = mk.gripLp ?: return@let
             gl.flags = flags
+            if (mk.type == "aim") gl.alpha = if (locked) 0.75f else 1f
             g.visibility = if (locked) View.GONE else View.VISIBLE
             wm.updateViewLayout(g, gl)
         }
