@@ -7,10 +7,16 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
+import android.net.LocalServerSocket
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.MotionEvent
@@ -20,6 +26,7 @@ import android.view.WindowManager.LayoutParams as LP
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONArray
@@ -37,6 +44,92 @@ class OverlayService : Service() {
     inner class Marker(val type: String, var key: String, val view: TextView, val lp: LP,
                        var wheel: MutableList<String> = mutableListOf("Key_W", "Key_A", "Key_S", "Key_D"))
 
+    // ---- simulated mouse cursor, driven by the PC over a local socket (adb forward) ----
+    private class CursorView(c: Context) : View(c) {
+        private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; style = Paint.Style.FILL }
+        private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.BLACK; style = Paint.Style.STROKE; strokeWidth = 3f }
+        private val path = Path()
+        override fun onDraw(canvas: Canvas) {
+            val s = width.toFloat()
+            path.reset()
+            path.moveTo(2f, 2f); path.lineTo(2f, s * 0.80f); path.lineTo(s * 0.25f, s * 0.62f)
+            path.lineTo(s * 0.42f, s * 0.95f); path.lineTo(s * 0.55f, s * 0.89f); path.lineTo(s * 0.38f, s * 0.57f)
+            path.lineTo(s * 0.65f, s * 0.57f); path.close()
+            canvas.drawPath(path, fill); canvas.drawPath(path, line)
+        }
+    }
+
+    private val ui = Handler(Looper.getMainLooper())
+    private var cursorView: CursorView? = null
+    private var cursorLp: LP? = null
+    private var cursorServer: LocalServerSocket? = null
+    @Volatile private var curX = 0f
+    @Volatile private var curY = 0f
+    @Volatile private var curShow = false
+    @Volatile private var curPending = false
+
+    private fun makeCursor() {
+        val sz = (30 * resources.displayMetrics.density).toInt()
+        val v = CursorView(this)
+        v.visibility = View.GONE
+        val lp = LP(sz, sz, LP.TYPE_APPLICATION_OVERLAY, baseFlags() or LP.FLAG_NOT_TOUCHABLE, PixelFormat.TRANSLUCENT)
+        lp.gravity = Gravity.TOP or Gravity.START
+        wm.addView(v, lp)
+        cursorView = v; cursorLp = lp
+    }
+
+    private fun applyCursor() {
+        curPending = false
+        val v = cursorView ?: return
+        val lp = cursorLp ?: return
+        if (!curShow) {
+            if (v.visibility != View.GONE) v.visibility = View.GONE
+            return
+        }
+        val m = real()
+        lp.x = (curX * m.widthPixels).toInt()
+        lp.y = (curY * m.heightPixels).toInt()
+        if (v.visibility != View.VISIBLE) {
+            // re-add so the cursor sits above every marker
+            runCatching { wm.removeView(v) }
+            v.visibility = View.VISIBLE
+            wm.addView(v, lp)
+        } else {
+            wm.updateViewLayout(v, lp)
+        }
+    }
+
+    private fun startCursorServer() {
+        Thread {
+            try {
+                val srv = LocalServerSocket("keymap_overlay_cursor")
+                cursorServer = srv
+                while (true) {
+                    val c = srv.accept()
+                    try {
+                        c.outputStream.write("OK\n".toByteArray())
+                        val r = java.io.BufferedReader(java.io.InputStreamReader(c.inputStream))
+                        while (true) {
+                            val line = r.readLine() ?: break
+                            val p = line.split(" ")
+                            if (p[0] == "P" && p.size >= 3) {
+                                curX = p[1].toFloat(); curY = p[2].toFloat(); curShow = true
+                            } else if (p[0] == "H") {
+                                curShow = false
+                            } else continue
+                            if (!curPending) { curPending = true; ui.post { applyCursor() } }
+                        }
+                    } catch (e: Exception) {
+                    }
+                    curShow = false
+                    ui.post { applyCursor() }
+                    try { c.close() } catch (e: Exception) { }
+                }
+            } catch (e: Exception) {
+            }
+        }.apply { isDaemon = true; start() }
+    }
+
     override fun onBind(i: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -48,6 +141,8 @@ class OverlayService : Service() {
             .setSmallIcon(android.R.drawable.ic_menu_edit).build())
         showPanel()
         loadExisting()
+        makeCursor()
+        startCursorServer()
     }
 
     override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
@@ -63,6 +158,8 @@ class OverlayService : Service() {
     override fun onDestroy() {
         markers.forEach { runCatching { wm.removeView(it.view) } }
         panel?.let { runCatching { wm.removeView(it) } }
+        cursorView?.let { runCatching { wm.removeView(it) } }
+        runCatching { cursorServer?.close() }
         super.onDestroy()
     }
 
@@ -96,7 +193,7 @@ class OverlayService : Service() {
     private fun addMarker(type: String, key: String, fx: Float, fy: Float): Marker {
         val m = real()
         val tv = TextView(this).apply {
-            text = if (type == "wheel") "WASD" else key.removePrefix("Key_")
+            text = if (type == "wheel") "MOVE" else labelFor(key)
             setTextColor(Color.WHITE); gravity = Gravity.CENTER; textSize = 12f; alpha = 0.85f
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
@@ -125,25 +222,100 @@ class OverlayService : Service() {
         return mk
     }
 
-    private fun editMarker(mk: Marker) {
-        val et = EditText(this).apply {
-            setText(if (mk.type == "wheel") mk.wheel.joinToString(",") else mk.key)
-            hint = if (mk.type == "wheel") "Up,Left,Down,Right e.g. Key_W,Key_A,Key_S,Key_D" else "e.g. Key_R, Key_Space, Button_Left"
-        }
-        val d = AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert)
-            .setTitle(if (mk.type == "wheel") "Wheel keys (up,left,down,right)" else "QtScrcpy key name")
-            .setView(et)
-            .setPositiveButton("OK") { _, _ ->
-                val t = et.text.toString().trim()
-                if (mk.type == "wheel") {
-                    val p = t.split(",").map { it.trim() }
-                    if (p.size == 4) mk.wheel = p.toMutableList()
-                } else { mk.key = t; mk.view.text = t.removePrefix("Key_").removePrefix("Button_") }
-            }
-            .setNeutralButton("Delete") { _, _ -> wm.removeView(mk.view); markers.remove(mk) }
-            .setNegativeButton("Cancel", null).create()
+    // ---- key picker ----
+    private val KEYS_MOUSE = listOf("LMB" to "Button_Left", "RMB" to "Button_Right", "MMB" to "Button_Middle")
+    private val KEYS_SPECIAL = listOf("Space" to "Key_Space", "Shift" to "Key_Shift", "Ctrl" to "Key_Control",
+        "Alt" to "Key_Alt", "Tab" to "Key_Tab", "Esc" to "Key_Escape", "Enter" to "Key_Return",
+        "\u2191" to "Key_Up", "\u2193" to "Key_Down", "\u2190" to "Key_Left", "\u2192" to "Key_Right")
+    private val KEYS_LETTERS = ('A'..'Z').map { it.toString() to "Key_$it" }
+    private val KEYS_NUMS = ('0'..'9').map { it.toString() to "Key_$it" }
+    private val KEYS_F = (1..12).map { "F$it" to "Key_F$it" }
+    private val ALL_KEYS = KEYS_MOUSE + KEYS_SPECIAL + KEYS_LETTERS + KEYS_NUMS + KEYS_F
+
+    private fun labelFor(code: String): String =
+        ALL_KEYS.firstOrNull { it.second == code }?.first ?: code.removePrefix("Key_").removePrefix("Button_")
+
+    private fun overlayDialog(b: AlertDialog.Builder): AlertDialog {
+        val d = b.create()
         d.window?.setType(LP.TYPE_APPLICATION_OVERLAY)
         d.show()
+        return d
+    }
+
+    private fun theme() = android.R.style.Theme_Material_Light_Dialog_Alert
+
+    private fun keySection(title: String, items: List<Pair<String, String>>, onPick: (Pair<String, String>) -> Unit): View {
+        val cell = (58 * resources.displayMetrics.density).toInt()
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        box.addView(TextView(this).apply {
+            text = title; setPadding(8, 20, 8, 4); setTypeface(typeface, android.graphics.Typeface.BOLD)
+        })
+        val grid = android.widget.GridLayout(this).apply { columnCount = 5 }
+        for (kv in items) {
+            val b = Button(this).apply {
+                text = kv.first; textSize = 12f; setAllCaps(false); minimumWidth = 0; minWidth = 0
+                setPadding(2, 2, 2, 2); setOnClickListener { onPick(kv) }
+            }
+            val lp = android.widget.GridLayout.LayoutParams().apply { width = cell; height = cell }
+            grid.addView(b, lp)
+        }
+        box.addView(grid)
+        return box
+    }
+
+    private fun pickKey(title: String, onDelete: (() -> Unit)? = null, onPick: (String) -> Unit) {
+        var dlg: AlertDialog? = null
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(16, 8, 16, 8) }
+        fun sec(t: String, l: List<Pair<String, String>>) =
+            col.addView(keySection(t, l) { onPick(it.second); dlg?.dismiss() })
+        sec("Mouse", KEYS_MOUSE); sec("Special", KEYS_SPECIAL); sec("Letters", KEYS_LETTERS)
+        sec("Numbers", KEYS_NUMS); sec("Function", KEYS_F)
+        val b = AlertDialog.Builder(this, theme()).setTitle(title)
+            .setView(ScrollView(this).apply { addView(col) }).setNegativeButton("Cancel", null)
+        if (onDelete != null) b.setNeutralButton("Delete") { _, _ -> onDelete() }
+        dlg = overlayDialog(b)
+    }
+
+    private fun editMarker(mk: Marker) {
+        val del = { wm.removeView(mk.view); markers.remove(mk); Unit }
+        if (mk.type == "wheel") { editWheel(mk, del); return }
+        pickKey("Pick the button for this marker", del) { code ->
+            mk.key = code; mk.view.text = labelFor(code)
+        }
+    }
+
+    private fun editWheel(mk: Marker, del: () -> Unit) {
+        var dlg: AlertDialog? = null
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 12, 24, 12) }
+        col.addView(TextView(this).apply { text = "Presets" })
+        val presets = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val map = linkedMapOf(
+            "WASD" to listOf("Key_W", "Key_A", "Key_S", "Key_D"),
+            "Arrows" to listOf("Key_Up", "Key_Left", "Key_Down", "Key_Right"),
+            "ESDF" to listOf("Key_E", "Key_S", "Key_D", "Key_F"),
+            "IJKL" to listOf("Key_I", "Key_J", "Key_K", "Key_L"))
+        for ((name, keys) in map) {
+            presets.addView(Button(this).apply {
+                text = name; textSize = 12f; setAllCaps(false)
+                setOnClickListener { mk.wheel = keys.toMutableList(); dlg?.dismiss(); editWheel(mk, del) }
+            })
+        }
+        col.addView(presets)
+        col.addView(TextView(this).apply { text = "Or pick each direction"; setPadding(0, 16, 0, 0) })
+        val names = listOf("Up", "Left", "Down", "Right")
+        for (i in 0 until 4) {
+            col.addView(Button(this).apply {
+                text = names[i] + ": " + labelFor(mk.wheel[i]); setAllCaps(false)
+                setOnClickListener {
+                    dlg?.dismiss()
+                    pickKey("Key for " + names[i]) { code -> mk.wheel[i] = code; editWheel(mk, del) }
+                }
+            })
+        }
+        val b = AlertDialog.Builder(this, theme()).setTitle("Movement keys")
+            .setView(ScrollView(this).apply { addView(col) })
+            .setPositiveButton("Done", null).setNeutralButton("Delete") { _, _ -> del() }
+        dlg = overlayDialog(b)
     }
 
     private fun fx(mk: Marker, w: Int) = ((mk.lp.x + size / 2f) / w)

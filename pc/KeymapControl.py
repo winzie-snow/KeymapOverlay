@@ -12,9 +12,35 @@ PT_URL = "https://dl.google.com/android/repository/platform-tools-latest-windows
 BASE = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
 CFG = os.path.join(BASE, "keymapcontrol.json")
 NOWIN = 0x08000000 if os.name == "nt" else 0
+MODE_TEXT = {
+    "cursor": "CURSOR MODE - cursor visible on the phone\nPress ` to lock into the game  |  Esc = release",
+    "game": "GAME MODE - mouse turns the camera\nPress ` for the cursor  |  Esc = release",
+}
+MODE_BG = {"cursor": "#0d47a1", "game": "#1b5e20"}
 SERVER_VER = "5.0.1"
 SERVER_URL = f"https://github.com/Genymobile/scrcpy/releases/download/v{SERVER_VER}/scrcpy-server-v{SERVER_VER}"
 SERVER_JAR = os.path.join(BASE, "scrcpy-server.jar")
+BUNDLED_JAR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "scrcpy-server.jar")
+
+
+def get_server_jar(say):
+    """Bundled copy first, then one next to the exe, then a download with retries."""
+    for p in (BUNDLED_JAR, SERVER_JAR):
+        if os.path.isfile(p) and os.path.getsize(p) > 100000:
+            return p
+    for attempt in range(1, 4):
+        try:
+            say(f"Downloading scrcpy server v{SERVER_VER} (try {attempt}/3)...")
+            req = urllib.request.Request(SERVER_URL, headers={"User-Agent": "KeymapControl"})
+            with urllib.request.urlopen(req, timeout=30) as r, open(SERVER_JAR, "wb") as f:
+                shutil.copyfileobj(r, f)
+            return SERVER_JAR
+        except Exception as e:
+            say(f"Download failed: {e}")
+            time.sleep(2)
+    say(f"Download scrcpy-server-v{SERVER_VER} manually from {SERVER_URL}")
+    say("and save it as scrcpy-server.jar next to this program.")
+    return None
 SERVER_REMOTE = "/data/local/tmp/scrcpy-server.jar"
 if os.name == "nt":
     try:
@@ -74,12 +100,12 @@ class TouchLink:
 
     def start(self, serial):
         a = self.app
-        if not os.path.isfile(SERVER_JAR):
-            a.say("Downloading scrcpy server v" + SERVER_VER + "...")
-            urllib.request.urlretrieve(SERVER_URL, SERVER_JAR)
+        jar = get_server_jar(a.say)
+        if not jar:
+            return False
         base = [a.adb, "-s", serial]
         run = lambda args: subprocess.run(base + args, capture_output=True, text=True, timeout=30, creationflags=NOWIN)
-        r = run(["push", SERVER_JAR, SERVER_REMOTE])
+        r = run(["push", jar, SERVER_REMOTE])
         if r.returncode != 0:
             a.say("Push server failed: " + (r.stdout + r.stderr).strip())
             return False
@@ -152,6 +178,67 @@ class TouchLink:
             except Exception:
                 pass
         self.sock = self.proc = self.port = None
+
+
+class OverlayLink:
+    """Talks to the overlay app on the phone to draw the simulated mouse cursor."""
+
+    def __init__(self, app):
+        self.app = app
+        self.sock = None
+        self.port = None
+        self.alive = False
+
+    def start(self, serial):
+        a = self.app
+        base = [a.adb, "-s", serial]
+        try:
+            # make sure the overlay is running and locked (markers must not eat injected touches)
+            subprocess.run(base + ["shell", "am", "start-foreground-service", "-n", SVC, "-a", "LOCK"],
+                           capture_output=True, timeout=15, creationflags=NOWIN)
+            r = subprocess.run(base + ["forward", "tcp:0", "localabstract:keymap_overlay_cursor"],
+                               capture_output=True, text=True, timeout=15, creationflags=NOWIN)
+            self.port = int(r.stdout.strip().splitlines()[0])
+        except Exception as e:
+            a.say(f"Overlay link failed: {e}")
+            return False
+        for _ in range(14):
+            try:
+                s = socket.create_connection(("127.0.0.1", self.port), timeout=2)
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                s.settimeout(1.0)
+                if b"OK" in s.recv(8):
+                    s.settimeout(None)
+                    self.sock = s
+                    self.alive = True
+                    return True
+                s.close()
+            except Exception:
+                pass
+            time.sleep(0.25)
+        return False
+
+    def send(self, text):
+        if not self.alive:
+            return
+        try:
+            self.sock.sendall((text + "\n").encode())
+        except Exception:
+            self.alive = False
+
+    def stop(self):
+        self.alive = False
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+        if self.port and self.app.adb:
+            try:
+                subprocess.run([self.app.adb, "forward", "--remove", f"tcp:{self.port}"],
+                               capture_output=True, timeout=5, creationflags=NOWIN)
+            except Exception:
+                pass
+        self.sock = self.port = None
 
 
 if os.name == "nt":
@@ -243,7 +330,7 @@ class App:
         self.ay = tk.StringVar(value=self.cfg.get("ay", "0.5"))
         ttk.Entry(row, textvariable=self.ax, width=5).pack(side="left", padx=2)
         ttk.Entry(row, textvariable=self.ay, width=5).pack(side="left", padx=2)
-        self.area = tk.Label(g4, text="CLICK HERE to capture the mouse\n(Esc to release)", bg="#263238",
+        self.area = tk.Label(g4, text="CLICK HERE to capture the mouse\n(starts in cursor mode)", bg="#263238",
                              fg="white", height=5, cursor="hand2", relief="ridge")
         self.area.pack(fill="x", pady=6)
         self.area.bind("<Button-1>", lambda e: self.start_capture())
@@ -282,10 +369,11 @@ class App:
                 elif kind == "adb":
                     self.adb_label.config(text=self.adb_text())
                 elif kind == "capon":
-                    self.area.config(text="MOUSE CAPTURED - moving the phone crosshair\n(Esc to release)",
-                                     bg="#1b5e20", cursor="none")
+                    self.area.config(text=MODE_TEXT["cursor"], bg=MODE_BG["cursor"], cursor="none")
+                elif kind == "capmode":
+                    self.area.config(text=MODE_TEXT[val], bg=MODE_BG[val])
                 elif kind == "capend":
-                    self.area.config(text="CLICK HERE to capture the mouse\n(Esc to release)",
+                    self.area.config(text="CLICK HERE to capture the mouse\n(starts in cursor mode)",
                                      bg="#263238", cursor="hand2")
                 elif kind == "msg":
                     messagebox.showinfo("Keymap Control", val)
@@ -492,6 +580,8 @@ class App:
 
     def capture_run(self, serial, sens, ax, ay, landscape, rect):
         user32 = ctypes.windll.user32
+        ov = None
+        link = None
         try:
             size = self.screen_size(landscape)
             if not size:
@@ -505,61 +595,129 @@ class App:
                 if not self.link.start(serial):
                     return
             link = self.link
+            ov = OverlayLink(self)
+            if not ov.start(serial):
+                self.say("Phone cursor overlay not reachable - install the newest APK and start the overlay. "
+                         "Cursor mode will work but you won't see the cursor.")
             clicks = self.load_clicks()
-            self.say(f"Screen {w}x{h}. Mouse buttons mapped: {', '.join(clicks) or 'none (add Button_Left in the overlay keymap)'}")
+            self.say(f"Screen {w}x{h}. Game-mode mouse buttons: {', '.join(clicks) or 'none (set LMB/RMB markers in the overlay)'}")
             l, t, r, b = rect
             cx, cy = (l + r) // 2, (t + b) // 2
             clip = RECT(l, t, r, b)
             user32.ClipCursor(ctypes.byref(clip))
             user32.SetCursorPos(cx, cy)
             self.q.put(("capon", None))
+
+            pressed = lambda vk: bool(user32.GetAsyncKeyState(vk) & 0x8000)
             pt = POINT()
-            down = False
+            mode = "cursor"
+            curx, cury = w / 2.0, h / 2.0           # simulated cursor position (phone px)
+            cur_down = False                         # cursor-mode finger is down
+            prev_lm = pressed(1)
             camx = camy = 0.0
-            last_move = 0.0
-            held = {"Button_Left": bool(user32.GetAsyncKeyState(1) & 0x8000),
-                    "Button_Right": bool(user32.GetAsyncKeyState(2) & 0x8000)}
+            down = False                             # game-mode camera finger is down
+            last_move = last_sent = 0.0
+            dirty = True
+            held = {"Button_Left": pressed(1), "Button_Right": pressed(2)}
+            prev_hot = pressed(0xC0)                 # ` key toggles the mode
+            ov.send(f"P {curx / w:.4f} {cury / h:.4f}")
+
             while self.capturing and link.alive:
-                if user32.GetAsyncKeyState(0x1B) & 0x8000:
+                if pressed(0x1B):
                     break
+                now = time.time()
+                hot = pressed(0xC0)
+                if hot and not prev_hot:
+                    if mode == "cursor":
+                        if cur_down:
+                            link.send(1, 4, curx, cury, w, h, 0)
+                            cur_down = False
+                        mode = "game"
+                        ov.send("H")
+                        held = {"Button_Left": pressed(1), "Button_Right": pressed(2)}
+                    else:
+                        if down:
+                            link.send(1, 1, camx, camy, w, h, 0)
+                            down = False
+                        for key, pid in (("Button_Left", 2), ("Button_Right", 3)):
+                            if key in clicks and held.get(key):
+                                link.send(1, pid, clicks[key][0] * w, clicks[key][1] * h, w, h, 0)
+                        mode = "cursor"
+                        prev_lm = pressed(1)
+                        dirty = True
+                    self.q.put(("capmode", mode))
+                prev_hot = hot
+
                 user32.GetCursorPos(ctypes.byref(pt))
                 dx, dy = pt.x - cx, pt.y - cy
-                now = time.time()
-                if dx or dy:
+                moved = bool(dx or dy)
+                if moved:
                     user32.SetCursorPos(cx, cy)
-                    if not down:
-                        camx, camy = ax * w, ay * h
-                        link.send(0, 1, camx, camy, w, h)
-                        down = True
-                    camx += dx * sens
-                    camy += dy * sens
-                    if not (0.05 * w < camx < 0.95 * w and 0.05 * h < camy < 0.95 * h):
+
+                if mode == "cursor":
+                    if moved:
+                        curx = max(0.0, min(w - 1.0, curx + dx * sens))
+                        cury = max(0.0, min(h - 1.0, cury + dy * sens))
+                        dirty = True
+                        if cur_down:
+                            link.send(2, 4, curx, cury, w, h)
+                    lm = pressed(1)
+                    if lm and not prev_lm:
+                        link.send(0, 4, curx, cury, w, h)
+                        cur_down = True
+                    elif not lm and prev_lm and cur_down:
+                        link.send(1, 4, curx, cury, w, h, 0)
+                        cur_down = False
+                    prev_lm = lm
+                    if dirty and now - last_sent >= 0.008:
+                        ov.send(f"P {curx / w:.4f} {cury / h:.4f}")
+                        dirty = False
+                        last_sent = now
+                else:
+                    if moved:
+                        if not down:
+                            camx, camy = ax * w, ay * h
+                            link.send(0, 1, camx, camy, w, h)
+                            down = True
+                        camx += dx * sens
+                        camy += dy * sens
+                        if not (0.05 * w < camx < 0.95 * w and 0.05 * h < camy < 0.95 * h):
+                            link.send(1, 1, camx, camy, w, h, 0)
+                            camx, camy = ax * w, ay * h
+                            link.send(0, 1, camx, camy, w, h)
+                        link.send(2, 1, camx, camy, w, h)
+                        last_move = now
+                    elif down and now - last_move > 0.25:
                         link.send(1, 1, camx, camy, w, h, 0)
-                        camx, camy = ax * w, ay * h
-                        link.send(0, 1, camx, camy, w, h)
-                    link.send(2, 1, camx, camy, w, h)
-                    last_move = now
-                elif down and now - last_move > 0.25:
-                    link.send(1, 1, camx, camy, w, h, 0)
-                    down = False
-                for vk, pid, key in ((1, 2, "Button_Left"), (2, 3, "Button_Right")):
-                    if key not in clicks:
-                        continue
-                    state = bool(user32.GetAsyncKeyState(vk) & 0x8000)
-                    if state != held[key]:
-                        held[key] = state
-                        x, y = clicks[key][0] * w, clicks[key][1] * h
-                        link.send(0 if state else 1, pid, x, y, w, h, 0xFFFF if state else 0)
+                        down = False
+                    for vk, pid, key in ((1, 2, "Button_Left"), (2, 3, "Button_Right")):
+                        if key not in clicks:
+                            continue
+                        state = pressed(vk)
+                        if state != held[key]:
+                            held[key] = state
+                            link.send(0 if state else 1, pid, clicks[key][0] * w, clicks[key][1] * h, w, h,
+                                      0xFFFF if state else 0)
                 time.sleep(0.002)
+
+            # release everything that is still down
             if down:
                 link.send(1, 1, camx, camy, w, h, 0)
-            for vk, pid, key in ((1, 2, "Button_Left"), (2, 3, "Button_Right")):
-                if key in clicks and held[key]:
+            if cur_down:
+                link.send(1, 4, curx, cury, w, h, 0)
+            for key, pid in (("Button_Left", 2), ("Button_Right", 3)):
+                if key in clicks and held.get(key) and mode == "game":
                     link.send(1, pid, clicks[key][0] * w, clicks[key][1] * h, w, h, 0)
         except Exception as e:
             self.say(f"Capture error: {e}")
         finally:
-            user32.ClipCursor(None)
+            try:
+                user32.ClipCursor(None)
+            except Exception:
+                pass
+            if ov:
+                ov.send("H")
+                ov.stop()
             self.capturing = False
             self.q.put(("capend", None))
             self.say("Mouse released")
