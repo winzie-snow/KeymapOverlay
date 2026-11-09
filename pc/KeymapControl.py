@@ -363,6 +363,91 @@ def parse_wm_size(text):
     return found.get("override") or found.get("physical")
 
 
+# ---------- look & feel ----------
+BG, PANEL, BORDER = "#12161c", "#1b212a", "#2c3542"
+FG, MUTED, ACCENT, ACCENT_HI = "#e8edf3", "#8b98a8", "#29b6f6", "#4fc3f7"
+GOOD, BAD = "#43a047", "#e53935"
+
+
+def apply_theme(root):
+    root.configure(bg=BG)
+    st = ttk.Style(root)
+    st.theme_use("clam")
+    st.configure(".", background=BG, foreground=FG, fieldbackground=PANEL, bordercolor=BORDER,
+                 lightcolor=BG, darkcolor=BG, troughcolor=PANEL, focuscolor=BG, font=("Segoe UI", 10))
+    st.configure("TLabel", background=BG, foreground=FG)
+    st.configure("Muted.TLabel", foreground=MUTED, font=("Segoe UI", 9))
+    st.configure("Title.TLabel", font=("Segoe UI", 15, "bold"))
+    st.configure("Status.TLabel", font=("Segoe UI", 10, "bold"))
+    st.configure("TLabelframe", background=BG, bordercolor=BORDER, relief="solid", borderwidth=1)
+    st.configure("TLabelframe.Label", background=BG, foreground=ACCENT, font=("Segoe UI", 10, "bold"))
+    st.configure("TButton", background=PANEL, foreground=FG, bordercolor=BORDER, padding=(10, 6), relief="flat")
+    st.map("TButton", background=[("disabled", BG), ("pressed", BORDER), ("active", "#252d38")],
+           foreground=[("disabled", "#4b5563")], bordercolor=[("active", ACCENT)])
+    st.configure("Accent.TButton", background=ACCENT, foreground="#06232f", bordercolor=ACCENT,
+                 font=("Segoe UI", 10, "bold"), padding=(10, 8))
+    st.map("Accent.TButton", background=[("disabled", BG), ("pressed", "#0288d1"), ("active", ACCENT_HI)],
+           foreground=[("disabled", "#4b5563")], bordercolor=[("disabled", BORDER)])
+    st.configure("Danger.TButton", background="#3a1c1f", foreground="#ff8a80", bordercolor="#5a2a2e")
+    st.map("Danger.TButton", background=[("disabled", BG), ("active", BAD)],
+           foreground=[("disabled", "#4b5563"), ("active", "white")])
+    st.configure("Step.TButton", padding=(0, 0), width=2, font=("Segoe UI", 11, "bold"))
+    st.configure("TEntry", fieldbackground=PANEL, foreground=FG, insertcolor=FG, bordercolor=BORDER, padding=4)
+    st.configure("TSpinbox", fieldbackground=PANEL, foreground=ACCENT, insertcolor=FG, bordercolor=BORDER,
+                 arrowcolor=MUTED, background=PANEL, padding=3)
+    st.configure("TCombobox", fieldbackground=PANEL, foreground=FG, background=PANEL, arrowcolor=MUTED,
+                 bordercolor=BORDER, selectbackground=PANEL, selectforeground=FG, padding=4)
+    st.map("TCombobox", fieldbackground=[("readonly", PANEL)], foreground=[("readonly", FG)])
+    root.option_add("*TCombobox*Listbox.background", PANEL)
+    root.option_add("*TCombobox*Listbox.foreground", FG)
+    root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+    root.option_add("*TCombobox*Listbox.selectForeground", "#06232f")
+    st.configure("TCheckbutton", background=BG, foreground=FG, indicatorbackground=PANEL,
+                 indicatorforeground=ACCENT, indicatorcolor=PANEL)
+    st.map("TCheckbutton", indicatorcolor=[("selected", ACCENT)], background=[("active", BG)])
+    st.configure("Horizontal.TScale", background=BG, troughcolor=BORDER, bordercolor=BG, lightcolor=ACCENT,
+                 darkcolor=ACCENT)
+    st.map("Horizontal.TScale", background=[("active", ACCENT_HI)])
+    st.configure("Vertical.TScrollbar", background=PANEL, troughcolor=BG, bordercolor=BG, arrowcolor=MUTED)
+
+
+class SliderField(ttk.Frame):
+    """[-] ---slider--- [+] [ value ]  - the number is editable, so you can drag, click +/- or just type."""
+
+    def __init__(self, parent, var, lo, hi, step, fmt="{:.1f}", length=170, on_change=None):
+        super().__init__(parent)
+        self.var, self.lo, self.hi, self.step, self.fmt, self.on_change = var, lo, hi, step, fmt, on_change
+        self.txt = tk.StringVar(value=fmt.format(var.get()))
+        ttk.Button(self, text="\u2212", style="Step.TButton", command=lambda: self.nudge(-1)).pack(side="left")
+        self.scale = ttk.Scale(self, from_=lo, to=hi, variable=var, length=length, command=self._drag)
+        self.scale.pack(side="left", padx=6)
+        ttk.Button(self, text="+", style="Step.TButton", command=lambda: self.nudge(1)).pack(side="left")
+        self.box = ttk.Spinbox(self, from_=lo, to=hi, increment=step, textvariable=self.txt, width=6,
+                               justify="center", command=self._typed)
+        self.box.pack(side="left", padx=(8, 0))
+        self.box.bind("<Return>", lambda e: self._typed())
+        self.box.bind("<FocusOut>", lambda e: self._typed())
+
+    def _set(self, v):
+        v = min(self.hi, max(self.lo, round(round(v / self.step) * self.step, 4)))
+        self.var.set(v)
+        self.txt.set(self.fmt.format(v))
+        if self.on_change:
+            self.on_change(v)
+
+    def _drag(self, raw):
+        self._set(float(raw))
+
+    def _typed(self):
+        try:
+            self._set(float(self.txt.get().replace(",", ".")))
+        except ValueError:
+            self.txt.set(self.fmt.format(self.var.get()))
+
+    def nudge(self, d):
+        self._set(self.var.get() + d * self.step)
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -372,7 +457,9 @@ class App:
         self.devices = []
         self.running = True
         root.title("Keymap Control")
-        root.geometry("560x560")
+        root.geometry("620x720")
+        root.minsize(560, 620)
+        apply_theme(root)
         self.build_ui()
         threading.Thread(target=self.poll_loop, daemon=True).start()
         self.root.after(100, self.pump)
@@ -380,75 +467,84 @@ class App:
 
     # ---------- UI ----------
     def build_ui(self):
-        top = ttk.Frame(self.root, padding=10)
+        head = ttk.Frame(self.root, padding=(14, 12, 14, 4))
+        head.pack(fill="x")
+        ttk.Label(head, text="Keymap Control", style="Title.TLabel").pack(side="left")
+        ttk.Label(head, text="mouse + keyboard for your phone", style="Muted.TLabel").pack(side="left", padx=10, pady=(6, 0))
+
+        top = ttk.Frame(self.root, padding=(14, 6))
         top.pack(fill="x")
-        self.dot = tk.Canvas(top, width=22, height=22, highlightthickness=0)
+        self.dot = tk.Canvas(top, width=22, height=22, highlightthickness=0, bg=BG)
         self.dot.pack(side="left")
-        self.led = self.dot.create_oval(3, 3, 19, 19, fill="#c62828", outline="")
-        self.status = ttk.Label(top, text="Starting...", font=("Segoe UI", 11, "bold"))
+        self.led = self.dot.create_oval(3, 3, 19, 19, fill=BAD, outline="")
+        self.status = ttk.Label(top, text="Starting...", style="Status.TLabel")
         self.status.pack(side="left", padx=8)
         self.combo = ttk.Combobox(top, state="readonly", width=24)
         self.combo.pack(side="right")
 
-        adbrow = ttk.Frame(self.root, padding=(10, 0))
+        adbrow = ttk.Frame(self.root, padding=(14, 0))
         adbrow.pack(fill="x")
-        self.adb_label = ttk.Label(adbrow, text=self.adb_text())
+        self.adb_label = ttk.Label(adbrow, text=self.adb_text(), style="Muted.TLabel")
         self.adb_label.pack(side="left")
         ttk.Button(adbrow, text="Download ADB", command=lambda: self.bg(self.download_adb)).pack(side="right")
         ttk.Button(adbrow, text="Browse...", command=self.browse_adb).pack(side="right", padx=4)
 
         self.btns = []
-        g1 = ttk.LabelFrame(self.root, text="App", padding=8)
-        g1.pack(fill="x", padx=10, pady=6)
+        g1 = ttk.LabelFrame(self.root, text=" App ", padding=10)
+        g1.pack(fill="x", padx=14, pady=6)
         self.add_btn(g1, "Install APK...", self.install_apk, 0, 0)
         self.add_btn(g1, "Grant overlay permission", self.grant, 0, 1)
         self.add_btn(g1, "Open app", lambda: self.shell(f"monkey -p {PKG} -c android.intent.category.LAUNCHER 1"), 0, 2)
 
-        g2 = ttk.LabelFrame(self.root, text="Overlay", padding=8)
-        g2.pack(fill="x", padx=10, pady=6)
-        self.add_btn(g2, "Start", lambda: self.svc(None), 0, 0)
+        g2 = ttk.LabelFrame(self.root, text=" Overlay ", padding=10)
+        g2.pack(fill="x", padx=14, pady=6)
+        self.add_btn(g2, "\u25b6 Start", lambda: self.svc(None), 0, 0, "Accent.TButton")
         self.add_btn(g2, "Reload", lambda: self.svc("RELOAD"), 0, 1)
         self.add_btn(g2, "Lock", lambda: self.svc("LOCK"), 0, 2)
         self.add_btn(g2, "Edit", lambda: self.svc("EDIT"), 0, 3)
-        self.add_btn(g2, "Stop", lambda: self.svc("STOP"), 0, 4)
+        self.add_btn(g2, "Stop", lambda: self.svc("STOP"), 0, 4, "Danger.TButton")
 
-        g3 = ttk.LabelFrame(self.root, text="Keymap file", padding=8)
-        g3.pack(fill="x", padx=10, pady=6)
+        g3 = ttk.LabelFrame(self.root, text=" Keymap file ", padding=10)
+        g3.pack(fill="x", padx=14, pady=6)
         self.add_btn(g3, "Push keymap.json...", self.push, 0, 0)
         self.add_btn(g3, "Pull keymap.json...", self.pull, 0, 1)
 
-        self.quick = ttk.Button(self.root, text="Quick start: grant + push last keymap + show overlay",
-                                command=lambda: self.bg(self.quick_start))
-        self.quick.pack(fill="x", padx=10, pady=4)
+        self.quick = ttk.Button(self.root, text="\u26a1  Quick start: grant + push last keymap + show overlay",
+                                style="Accent.TButton", command=lambda: self.bg(self.quick_start))
+        self.quick.pack(fill="x", padx=14, pady=6)
         self.btns.append(self.quick)
 
         self.link = None
         self.capturing = False
-        g4 = ttk.LabelFrame(self.root, text="Mouse (crosshair on phone)", padding=8)
-        g4.pack(fill="x", padx=10, pady=6)
+        g4 = ttk.LabelFrame(self.root, text=" Mouse (crosshair on phone) ", padding=10)
+        g4.pack(fill="x", padx=14, pady=6)
         row = ttk.Frame(g4)
         row.pack(fill="x")
         ttk.Label(row, text="Sensitivity").pack(side="left")
         self.sens = tk.DoubleVar(value=self.cfg.get("sens", 2.0))
-        ttk.Scale(row, from_=0.3, to=6, variable=self.sens, length=130).pack(side="left", padx=6)
+        SliderField(row, self.sens, 0.3, 6.0, 0.1).pack(side="left", padx=10)
         self.land = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row, text="Landscape", variable=self.land).pack(side="left", padx=6)
-        ttk.Label(row, text="Fallback cam X,Y").pack(side="left")
+        ttk.Checkbutton(row, text="Landscape", variable=self.land).pack(side="right")
+        row2 = ttk.Frame(g4)
+        row2.pack(fill="x", pady=(8, 0))
+        ttk.Label(row2, text="Fallback cam X, Y").pack(side="left")
         self.ax = tk.StringVar(value=self.cfg.get("ax", "0.75"))
         self.ay = tk.StringVar(value=self.cfg.get("ay", "0.5"))
-        ttk.Entry(row, textvariable=self.ax, width=5).pack(side="left", padx=2)
-        ttk.Entry(row, textvariable=self.ay, width=5).pack(side="left", padx=2)
+        ttk.Entry(row2, textvariable=self.ax, width=6, justify="center").pack(side="left", padx=(10, 4))
+        ttk.Entry(row2, textvariable=self.ay, width=6, justify="center").pack(side="left", padx=4)
         self.area = tk.Label(g4, text="CLICK HERE to capture the mouse\n(starts in cursor mode)", bg="#263238",
-                             fg="white", height=5, cursor="hand2", relief="ridge")
-        self.area.pack(fill="x", pady=6)
+                             fg="white", height=5, cursor="hand2", relief="flat", font=("Segoe UI", 11, "bold"))
+        self.area.pack(fill="x", pady=(10, 0))
         self.area.bind("<Button-1>", lambda e: self.start_capture())
 
-        self.log = ScrolledText(self.root, height=12, state="disabled", font=("Consolas", 9))
-        self.log.pack(fill="both", expand=True, padx=10, pady=8)
+        self.log = ScrolledText(self.root, height=9, state="disabled", font=("Consolas", 9), bg=PANEL, fg=MUTED,
+                                relief="flat", borderwidth=0, highlightthickness=1, highlightbackground=BORDER,
+                                highlightcolor=BORDER, insertbackground=FG)
+        self.log.pack(fill="both", expand=True, padx=14, pady=(6, 14))
         self.set_enabled(False)
 
-    def add_btn(self, parent, text, cmd, r, c):
-        b = ttk.Button(parent, text=text, command=lambda: self.bg(cmd))
+    def add_btn(self, parent, text, cmd, r, c, style="TButton"):
+        b = ttk.Button(parent, text=text, style=style, command=lambda: self.bg(cmd))
         b.grid(row=r, column=c, padx=3, pady=2, sticky="ew")
         parent.columnconfigure(c, weight=1)
         self.btns.append(b)
@@ -494,16 +590,16 @@ class App:
         self.devices = devs
         ready = [d for d in devs if d[1] == "device"]
         if not self.adb:
-            self.led_set("#c62828", "ADB not found")
+            self.led_set(BAD, "ADB not found")
         elif ready:
             d = ready[0]
-            self.led_set("#2e7d32", f"Connected: {d[2] or d[0]}")
+            self.led_set(GOOD, f"Connected: {d[2] or d[0]}")
         elif devs:
             st = devs[0][1]
             hint = {"unauthorized": "Accept the USB debugging prompt on the phone", "offline": "Replug the cable"}.get(st, st)
             self.led_set("#f9a825", f"{st}: {hint}")
         else:
-            self.led_set("#c62828", "No device connected")
+            self.led_set(BAD, "No device connected")
         names = [f"{d[2] or d[0]} ({d[0]})" for d in ready]
         self.combo["values"] = names
         if names and self.combo.get() not in names:

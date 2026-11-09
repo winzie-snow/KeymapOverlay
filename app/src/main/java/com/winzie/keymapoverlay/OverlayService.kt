@@ -7,6 +7,7 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -46,6 +47,44 @@ class OverlayService : Service() {
     private var hideAllButton: Button? = null
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    // ---------- look & feel ----------
+    private val C_BG = 0xF0151A21.toInt()        // toolbar background
+    private val C_PANEL = 0xFF262F3B.toInt()     // buttons / fields
+    private val C_ACCENT = 0xFF29B6F6.toInt()
+    private val C_ON_ACCENT = 0xFF06232F.toInt()
+    private val C_TEXT = 0xFFE8EDF3.toInt()
+    private val C_MUTED = 0xFF8B98A8.toInt()
+    private val C_GOOD = 0xFF43A047.toInt()
+    private val C_BAD = 0xFFE53935.toInt()
+    private val C_LINE = 0xFF2C3542.toInt()
+
+    private fun rounded(color: Int, r: Int = 10, stroke: Int = 0) = GradientDrawable().apply {
+        cornerRadius = dp(r).toFloat(); setColor(color)
+        if (stroke != 0) setStroke(dp(1), stroke)
+    }
+
+    private fun styleBtn(b: Button, bg: Int = C_PANEL, fg: Int = C_TEXT) {
+        b.background = rounded(bg, 10)
+        b.setTextColor(fg)
+        b.stateListAnimator = null
+        b.setAllCaps(false)
+        b.minWidth = 0; b.minimumWidth = 0; b.minHeight = 0; b.minimumHeight = 0
+    }
+
+    private fun actionBtn(t: String, bg: Int = C_PANEL, fg: Int = C_TEXT, click: () -> Unit): Button =
+        Button(this).apply { text = t; textSize = 13f; styleBtn(this, bg, fg); setOnClickListener { click() } }
+
+    private fun rowLp() = LinearLayout.LayoutParams(-1, dp(44)).apply { topMargin = dp(6) }
+
+    private fun hint(t: String) = TextView(this).apply { text = t; textSize = 11f; setTextColor(C_MUTED); setPadding(0, dp(2), 0, dp(4)) }
+
+    private fun dialogColumn() = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(8), dp(20), dp(8)) }
+
+    private fun switchRow(t: String, on: Boolean, change: (Boolean) -> Unit) = android.widget.Switch(this).apply {
+        text = t; isChecked = on; setTextColor(C_TEXT); setPadding(0, dp(10), 0, 0)
+        setOnCheckedChangeListener { _, c -> change(c) }
+    }
 
     // type: "click", "wheel" (direction pad) or "aim" (mouse look)
     inner class Marker(val type: String, var key: String, val view: View, val lp: LP,
@@ -294,28 +333,29 @@ class OverlayService : Service() {
 
     // ---------- toolbar with hide / show bar ----------
     private fun showPanel() {
-        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setBackgroundColor(0xCC000000.toInt()) }
-        fun btn(t: String, f: (Button) -> Unit): Button = Button(this).apply {
-            text = t; textSize = 11f; setAllCaps(false); minWidth = 0; minimumWidth = 0
-            setPadding(dp(10), 0, dp(10), 0); setOnClickListener { f(this) }
-        }.also { row.addView(it, LinearLayout.LayoutParams(-2, dp(40))) }
-        btn("+Tap") { addMarker("click", "Key_R", 0.5f, 0.5f) }
-        btn("+Dir") { if (markers.none { it.type == "wheel" }) addMarker("wheel", "", 0.17f, 0.72f, dp(140)) }
-        btn("+Aim") { if (markers.none { it.type == "aim" }) addMarker("aim", "", 0.75f, 0.5f, dp(56)) }
-        btn("Save") { save() }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            background = rounded(C_BG, 16, C_LINE); setPadding(dp(6), dp(5), dp(6), dp(5))
+        }
+        fun btn(t: String, bg: Int = C_PANEL, fg: Int = C_TEXT, f: (Button) -> Unit): Button = Button(this).apply {
+            text = t; textSize = 11f; styleBtn(this, bg, fg)
+            setPadding(dp(11), 0, dp(11), 0); setOnClickListener { f(this) }
+        }.also { row.addView(it, LinearLayout.LayoutParams(-2, dp(36)).apply { setMargins(dp(2), 0, dp(2), 0) }) }
+        btn("+ Tap", C_ACCENT, C_ON_ACCENT) { addMarker("click", "Key_R", 0.5f, 0.5f) }
+        btn("+ Dir", C_ACCENT, C_ON_ACCENT) { if (markers.none { it.type == "wheel" }) addMarker("wheel", "", 0.17f, 0.72f, dp(140)) }
+        btn("+ Aim", C_ACCENT, C_ON_ACCENT) { if (markers.none { it.type == "aim" }) addMarker("aim", "", 0.75f, 0.5f, dp(56)) }
+        btn("Save", C_GOOD, Color.WHITE) { save() }
         lockButton = btn("Lock") { setLocked(!locked) }
         hideAllButton = btn(if (hideAll) "Show btns" else "Hide btns") { setHideAll(!hideAll) }
         btn("Hide") { setPanelHidden(true) }
-        btn("X") { stopSelf() }
+        btn("X", C_BAD, Color.WHITE) { stopSelf() }
         val lp = LP(-2, -2, LP.TYPE_APPLICATION_OVERLAY, baseFlags(), PixelFormat.TRANSLUCENT)
-        lp.gravity = Gravity.TOP or Gravity.START; lp.x = 0; lp.y = 0
+        lp.gravity = Gravity.TOP or Gravity.START; lp.x = dp(6); lp.y = dp(4)
         wm.addView(row, lp); panel = row
 
         // small bar shown while the toolbar is hidden: tap it to bring the menu back
         val bar = View(this).apply {
-            background = GradientDrawable().apply {
-                cornerRadius = dp(8).toFloat(); setColor(0xDDFFFFFF.toInt()); setStroke(dp(1), 0x99000000.toInt())
-            }
+            background = rounded(0xE629B6F6.toInt(), 8, 0x99000000.toInt())
             setOnClickListener { setPanelHidden(false) }
         }
         val blp = LP(dp(72), dp(16), LP.TYPE_APPLICATION_OVERLAY, baseFlags(), PixelFormat.TRANSLUCENT)
@@ -334,7 +374,10 @@ class OverlayService : Service() {
         // (resized range box, moved markers) even if Save was never tapped
         if (on && !locked && markers.isNotEmpty()) save()
         locked = on
-        lockButton?.text = if (on) "Edit" else "Lock"
+        lockButton?.let {
+            it.text = if (on) "Edit" else "Lock"
+            styleBtn(it, if (on) C_GOOD else C_PANEL, if (on) Color.WHITE else C_TEXT)
+        }
         applyLock()
     }
 
@@ -388,10 +431,11 @@ class OverlayService : Service() {
             "aim" -> AimView(this)
             else -> TextView(this).apply {
                 text = labelFor(key)
-                setTextColor(Color.WHITE); gravity = Gravity.CENTER; textSize = 12f
+                setTextColor(Color.WHITE); gravity = Gravity.CENTER; textSize = 13f
+                setTypeface(typeface, Typeface.BOLD)
                 background = GradientDrawable().apply {
                     shape = GradientDrawable.OVAL
-                    setColor(0xFFE53935.toInt()); setStroke(3, Color.WHITE) // opaque: the opacity slider does the fading
+                    setColor(0xFFE53935.toInt()); setStroke(dp(2), 0xF2FFFFFF.toInt()) // opaque: the opacity slider does the fading
                 }
             }
         }
@@ -550,25 +594,30 @@ class OverlayService : Service() {
     private fun overlayDialog(b: AlertDialog.Builder): AlertDialog {
         val d = b.create()
         d.window?.setType(LP.TYPE_APPLICATION_OVERLAY)
+        d.window?.setBackgroundDrawable(rounded(0xFF1B212A.toInt(), 18, C_LINE))
         d.show()
+        d.getButton(AlertDialog.BUTTON_POSITIVE)?.setTextColor(C_ACCENT)
+        d.getButton(AlertDialog.BUTTON_NEUTRAL)?.setTextColor(0xFFFF8A80.toInt())
+        d.getButton(AlertDialog.BUTTON_NEGATIVE)?.setTextColor(C_MUTED)
         return d
     }
 
-    private fun theme() = android.R.style.Theme_Material_Light_Dialog_Alert
+    private fun theme() = android.R.style.Theme_Material_Dialog_Alert
 
     private fun keySection(title: String, items: List<Pair<String, String>>, onPick: (Pair<String, String>) -> Unit): View {
-        val cell = dp(58)
+        val cell = dp(52)
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         box.addView(TextView(this).apply {
-            text = title; setPadding(8, 20, 8, 4); setTypeface(typeface, Typeface.BOLD)
+            text = title.uppercase(); textSize = 11f; setTextColor(C_ACCENT)
+            setPadding(dp(4), dp(14), dp(4), dp(4)); setTypeface(typeface, Typeface.BOLD)
         })
         val grid = android.widget.GridLayout(this).apply { columnCount = 5 }
         for (kv in items) {
             val b = Button(this).apply {
-                text = kv.first; textSize = 12f; setAllCaps(false); minimumWidth = 0; minWidth = 0
+                text = kv.first; textSize = 12f; styleBtn(this)
                 setPadding(2, 2, 2, 2); setOnClickListener { onPick(kv) }
             }
-            val lp = android.widget.GridLayout.LayoutParams().apply { width = cell; height = cell }
+            val lp = android.widget.GridLayout.LayoutParams().apply { width = cell; height = cell; setMargins(dp(2), dp(2), dp(2), dp(2)) }
             grid.addView(b, lp)
         }
         box.addView(grid)
@@ -577,7 +626,7 @@ class OverlayService : Service() {
 
     private fun pickKey(title: String, onDelete: (() -> Unit)? = null, onPick: (String) -> Unit) {
         var dlg: AlertDialog? = null
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(16, 8, 16, 8) }
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(12), dp(4), dp(12), dp(8)) }
         fun sec(t: String, l: List<Pair<String, String>>) =
             col.addView(keySection(t, l) { onPick(it.second); dlg?.dismiss() })
         sec("Mouse", KEYS_MOUSE); sec("Special", KEYS_SPECIAL); sec("Letters", KEYS_LETTERS)
@@ -588,22 +637,40 @@ class OverlayService : Service() {
         dlg = overlayDialog(b)
     }
 
-    private fun stepper(parent: LinearLayout, label: String, getV: () -> Int, setV: (Int) -> Unit,
-                        step: Int, min: Int, max: Int) {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, dp(4), 0, dp(4))
+    // label on top, then   [-] ======o====== [+] [ value ]   - drag, tap -/+ for single steps, value is always visible
+    private fun sliderRow(parent: LinearLayout, label: String, unit: String, getV: () -> Int, setV: (Int) -> Unit,
+                          min: Int, max: Int, step: Int = 1) {
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, dp(12), 0, 0) }
+        box.addView(TextView(this).apply { text = label; textSize = 12f; setTextColor(C_MUTED) })
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val value = TextView(this).apply {
+            gravity = Gravity.CENTER; textSize = 14f; setTextColor(C_ACCENT); setTypeface(typeface, Typeface.BOLD)
+            background = rounded(0xFF0F1318.toInt(), 8, C_LINE); minWidth = dp(78); setPadding(dp(6), dp(7), dp(6), dp(7))
         }
-        row.addView(TextView(this).apply { text = label }, LinearLayout.LayoutParams(0, -2, 1f))
-        val value = TextView(this).apply { text = getV().toString(); gravity = Gravity.CENTER; minWidth = dp(60) }
-        fun bump(d: Int) { setV((getV() + d * step).coerceIn(min, max)); value.text = getV().toString() }
-        row.addView(Button(this).apply {
-            text = "-"; minWidth = 0; minimumWidth = 0; setOnClickListener { bump(-1) }
-        }, LinearLayout.LayoutParams(dp(48), dp(44)))
-        row.addView(value)
-        row.addView(Button(this).apply {
-            text = "+"; minWidth = 0; minimumWidth = 0; setOnClickListener { bump(1) }
-        }, LinearLayout.LayoutParams(dp(48), dp(44)))
-        parent.addView(row)
+        val bar = SeekBar(this)
+        val steps = ((max - min) / step).coerceAtLeast(1)
+        val start = getV().coerceIn(min, max)
+        bar.max = steps
+        bar.progress = (start - min) / step
+        value.text = "$start$unit"
+        bar.progressTintList = ColorStateList.valueOf(C_ACCENT)
+        bar.thumbTintList = ColorStateList.valueOf(C_ACCENT)
+        bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                val v = (min + p * step).coerceIn(min, max)
+                value.text = "$v$unit"
+                setV(v)
+            }
+            override fun onStartTrackingTouch(s: SeekBar?) {}
+            override fun onStopTrackingTouch(s: SeekBar?) {}
+        })
+        fun nudge(d: Int) { bar.progress = (bar.progress + d).coerceIn(0, bar.max) }
+        row.addView(actionBtn("\u2212") { nudge(-1) }, LinearLayout.LayoutParams(dp(38), dp(38)))
+        row.addView(bar, LinearLayout.LayoutParams(0, -2, 1f))
+        row.addView(actionBtn("+") { nudge(1) }, LinearLayout.LayoutParams(dp(38), dp(38)))
+        row.addView(value, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(8) })
+        box.addView(row)
+        parent.addView(box)
     }
 
     private fun editMarker(mk: Marker) {
@@ -616,38 +683,19 @@ class OverlayService : Service() {
     }
 
     // opacity slider (10..100 %), applied live to the marker behind the dialog
-    private fun opacityRow(parent: LinearLayout, mk: Marker) {
-        val label = TextView(this).apply { setPadding(0, dp(12), 0, 0) }
-        fun show() { label.text = "Opacity: " + Math.round(mk.alpha * 100) + "%" }
-        show()
-        parent.addView(label)
-        parent.addView(SeekBar(this).apply {
-            max = 90
-            progress = Math.round(mk.alpha * 100) - 10
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
-                    mk.alpha = (p + 10) / 100f
-                    show()
-                    applyMarkerState(mk)
-                }
-                override fun onStartTrackingTouch(s: SeekBar?) {}
-                override fun onStopTrackingTouch(s: SeekBar?) {}
-            })
-        })
-    }
+    private fun opacityRow(parent: LinearLayout, mk: Marker) =
+        sliderRow(parent, "Opacity", " %", { Math.round(mk.alpha * 100) },
+            { mk.alpha = it / 100f; applyMarkerState(mk) }, 10, 100, 1)
 
     private fun editTap(mk: Marker, del: () -> Unit) {
         var dlg: AlertDialog? = null
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 12, 24, 12) }
-        col.addView(Button(this).apply {
-            text = "Key: " + labelFor(mk.key); setAllCaps(false)
-            setOnClickListener {
-                dlg?.dismiss()
-                pickKey("Pick the button for this marker") { code ->
-                    mk.key = code; (mk.view as TextView).text = labelFor(code); editTap(mk, del)
-                }
+        val col = dialogColumn()
+        col.addView(actionBtn("Key:  " + labelFor(mk.key), C_ACCENT, C_ON_ACCENT) {
+            dlg?.dismiss()
+            pickKey("Pick the button for this marker") { code ->
+                mk.key = code; (mk.view as TextView).text = labelFor(code); editTap(mk, del)
             }
-        })
+        }, rowLp())
         opacityRow(col, mk)
         val b = AlertDialog.Builder(this, theme()).setTitle("Tap button")
             .setView(ScrollView(this).apply { addView(col) })
@@ -657,38 +705,39 @@ class OverlayService : Service() {
 
     private fun editWheel(mk: Marker, del: () -> Unit) {
         var dlg: AlertDialog? = null
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 12, 24, 12) }
-        col.addView(TextView(this).apply { text = "Presets" })
-        val presets = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val col = dialogColumn()
+        col.addView(TextView(this).apply { text = "PRESETS"; textSize = 11f; setTextColor(C_ACCENT); setTypeface(typeface, Typeface.BOLD) })
+        val presets = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, dp(4), 0, 0) }
         val map = linkedMapOf(
             "WASD" to listOf("Key_W", "Key_A", "Key_S", "Key_D"),
             "Arrows" to listOf("Key_Up", "Key_Left", "Key_Down", "Key_Right"),
             "ESDF" to listOf("Key_E", "Key_S", "Key_D", "Key_F"),
             "IJKL" to listOf("Key_I", "Key_J", "Key_K", "Key_L"))
         for ((name, keys) in map) {
-            presets.addView(Button(this).apply {
-                text = name; textSize = 12f; setAllCaps(false)
-                setOnClickListener { mk.wheel = keys.toMutableList(); refreshWheel(mk); dlg?.dismiss(); editWheel(mk, del) }
-            })
+            presets.addView(actionBtn(name) {
+                mk.wheel = keys.toMutableList(); refreshWheel(mk); dlg?.dismiss(); editWheel(mk, del)
+            }, LinearLayout.LayoutParams(0, dp(40), 1f).apply { setMargins(dp(2), 0, dp(2), 0) })
         }
         col.addView(presets)
-        col.addView(TextView(this).apply { text = "Or pick each direction"; setPadding(0, 16, 0, 0) })
+        col.addView(TextView(this).apply {
+            text = "OR PICK EACH DIRECTION"; textSize = 11f; setTextColor(C_ACCENT)
+            setTypeface(typeface, Typeface.BOLD); setPadding(0, dp(14), 0, 0)
+        })
         val names = listOf("Up", "Left", "Down", "Right")
-        for (i in 0 until 4) {
-            col.addView(Button(this).apply {
-                text = names[i] + ": " + labelFor(mk.wheel[i]); setAllCaps(false)
-                setOnClickListener {
+        for (r in 0 until 2) {
+            val line = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, dp(4), 0, 0) }
+            for (c in 0 until 2) {
+                val i = r * 2 + c
+                line.addView(actionBtn(names[i] + ":  " + labelFor(mk.wheel[i])) {
                     dlg?.dismiss()
                     pickKey("Key for " + names[i]) { code -> mk.wheel[i] = code; refreshWheel(mk); editWheel(mk, del) }
-                }
-            })
+                }, LinearLayout.LayoutParams(0, dp(42), 1f).apply { setMargins(dp(2), 0, dp(2), 0) })
+            }
+            col.addView(line)
         }
-        stepper(col, "Size (dp)", { (mk.lp.width / resources.displayMetrics.density).toInt() },
-            { setWheelSize(mk, dp(it)) }, 10, 80, 320)
-        col.addView(TextView(this).apply {
-            text = "Tip: you can also drag the round handle on the pad to resize it."
-            textSize = 11f
-        })
+        sliderRow(col, "Size", " dp", { (mk.lp.width / resources.displayMetrics.density).toInt() },
+            { setWheelSize(mk, dp(it)) }, 80, 320, 5)
+        col.addView(hint("Tip: you can also drag the round handle on the pad to resize it."))
         opacityRow(col, mk)
         val b = AlertDialog.Builder(this, theme()).setTitle("Direction keys")
             .setView(ScrollView(this).apply { addView(col) })
@@ -698,45 +747,24 @@ class OverlayService : Service() {
 
     private fun editAim(mk: Marker, del: () -> Unit) {
         val m = real()
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 12, 24, 12) }
-        col.addView(TextView(this).apply {
-            text = "On the PC, press ` to switch between cursor and aim mode. " +
-                "Drag the round handle on the range box to resize it."
-            textSize = 11f; setPadding(0, 0, 0, dp(8))
-        })
+        val col = dialogColumn()
+        col.addView(hint("On the PC, press ` to switch between cursor and aim mode. " +
+            "Drag the round handle on the range box to resize it."))
         // every change is written to keymap.json right away (the PC picks it up live), no Save/Lock needed
-        stepper(col, "X-axis sensitivity", { mk.sensX }, { mk.sensX = it; save(true) }, 5, 5, 200)
-        stepper(col, "Y-axis sensitivity", { mk.sensY }, { mk.sensY = it; save(true) }, 5, 5, 200)
-        stepper(col, "X-axis range (px)", { (mk.rangeW * m.widthPixels).toInt() },
-            { mk.rangeW = it / m.widthPixels.toFloat(); syncRange(mk); save(true) }, 20, dp(120), m.widthPixels)
-        stepper(col, "Y-axis range (px)", { (mk.rangeH * m.heightPixels).toInt() },
-            { mk.rangeH = it / m.heightPixels.toFloat(); syncRange(mk); save(true) }, 20, dp(120), m.heightPixels)
-        col.addView(android.widget.Switch(this).apply {
-            text = "Reset"; isChecked = mk.reset; setPadding(0, dp(8), 0, 0)
-            setOnCheckedChangeListener { _, c -> mk.reset = c; save(true) }
-        })
-        col.addView(TextView(this).apply {
-            text = "If enabled, turning never stops: when the mouse goes out of range the PC hands the camera over to a " +
-                "fresh finger at the center (see AIM_HANDOFF in KeymapControl.py)."
-            textSize = 11f
-        })
-        col.addView(android.widget.Switch(this).apply {
-            text = "Hide range box while playing"; isChecked = mk.hideBox; setPadding(0, dp(8), 0, 0)
-            setOnCheckedChangeListener { _, c -> mk.hideBox = c; applyMarkerState(mk); save(true) }
-        })
-        col.addView(TextView(this).apply {
-            text = "The box stays visible in Edit mode so you can still resize it."
-            textSize = 11f
-        })
-        col.addView(android.widget.Switch(this).apply {
-            text = "Crosshair at screen center"; isChecked = mk.centerCross; setPadding(0, dp(8), 0, 0)
-            setOnCheckedChangeListener { _, c -> mk.centerCross = c; applyMarkerState(mk); save(true) }
-        })
-        col.addView(TextView(this).apply {
-            text = "A fixed crosshair in the middle of the screen. The aim pad stays where it is, so you can still see " +
-                "where the camera finger touches and moves."
-            textSize = 11f
-        })
+        sliderRow(col, "X-axis sensitivity", "", { mk.sensX }, { mk.sensX = it; save(true) }, 5, 200, 1)
+        sliderRow(col, "Y-axis sensitivity", "", { mk.sensY }, { mk.sensY = it; save(true) }, 5, 200, 1)
+        sliderRow(col, "X-axis range", " px", { (mk.rangeW * m.widthPixels).toInt() },
+            { mk.rangeW = it / m.widthPixels.toFloat(); syncRange(mk); save(true) }, dp(120), m.widthPixels, 10)
+        sliderRow(col, "Y-axis range", " px", { (mk.rangeH * m.heightPixels).toInt() },
+            { mk.rangeH = it / m.heightPixels.toFloat(); syncRange(mk); save(true) }, dp(120), m.heightPixels, 10)
+        col.addView(switchRow("Reset", mk.reset) { mk.reset = it; save(true) })
+        col.addView(hint("If enabled, turning never stops: when the mouse goes out of range the PC hands the camera over to a " +
+            "fresh finger at the center (see AIM_HANDOFF in KeymapControl.py)."))
+        col.addView(switchRow("Hide range box while playing", mk.hideBox) { mk.hideBox = it; applyMarkerState(mk); save(true) })
+        col.addView(hint("The box stays visible in Edit mode so you can still resize it."))
+        col.addView(switchRow("Crosshair at screen center", mk.centerCross) { mk.centerCross = it; applyMarkerState(mk); save(true) })
+        col.addView(hint("A fixed crosshair in the middle of the screen. The aim pad stays where it is, so you can still see " +
+            "where the camera finger touches and moves."))
         opacityRow(col, mk)
         val b = AlertDialog.Builder(this, theme()).setTitle("Aim settings")
             .setView(ScrollView(this).apply { addView(col) })
