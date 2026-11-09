@@ -1,5 +1,5 @@
 """Keymap Control - Windows control panel for the Keymap Overlay APK, using ADB."""
-import ctypes, json, os, queue, re, shutil, socket, struct, subprocess, sys, threading, time, urllib.request, zipfile
+import ctypes, json, math, os, queue, re, shutil, socket, struct, subprocess, sys, threading, time, urllib.request, zipfile
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -13,8 +13,8 @@ BASE = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.p
 CFG = os.path.join(BASE, "keymapcontrol.json")
 NOWIN = 0x08000000 if os.name == "nt" else 0
 MODE_TEXT = {
-    "cursor": "CURSOR MODE - cursor visible on the phone\nPress ` to lock into the game  |  Esc = release",
-    "game": "GAME MODE - mouse turns the camera\nPress ` for the cursor  |  Esc = release",
+    "cursor": "CURSOR MODE - cursor visible on the phone\nPress {k} to switch to aim  |  Esc = release",
+    "game": "AIM MODE - mouse moves the camera, keys and buttons are active\nPress {k} to bring back the cursor  |  Esc = release",
 }
 MODE_BG = {"cursor": "#0d47a1", "game": "#1b5e20"}
 SERVER_VER = "5.0.1"
@@ -249,6 +249,34 @@ if os.name == "nt":
         _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
 
+MOUSE_VK = {"Button_Left": 1, "Button_Right": 2, "Button_Middle": 4, "Button_Back": 5, "Button_Forward": 6}
+SPECIAL_VK = {"Space": 0x20, "Shift": 0x10, "Control": 0x11, "Alt": 0x12, "Tab": 0x09, "Return": 0x0D,
+              "Up": 0x26, "Down": 0x28, "Left": 0x25, "Right": 0x27, "QuoteLeft": 0xC0}
+LABELS = {"Button_Left": "LMB", "Button_Right": "RMB", "Button_Middle": "MMB", "Button_Back": "M4",
+          "Button_Forward": "M5", "Key_QuoteLeft": "`", "Key_Control": "Ctrl", "Key_Return": "Enter",
+          "Key_Escape": "Esc"}
+
+
+def vk_for(key):
+    """Windows virtual-key code for a keymap key name (None if unsupported; Esc is reserved for release)."""
+    if key in MOUSE_VK:
+        return MOUSE_VK[key]
+    if not key or not key.startswith("Key_"):
+        return None
+    n = key[4:]
+    if len(n) == 1 and n.isalnum():
+        return ord(n.upper())
+    if n in SPECIAL_VK:
+        return SPECIAL_VK[n]
+    if n[0] == "F" and n[1:].isdigit() and 1 <= int(n[1:]) <= 12:
+        return 0x70 + int(n[1:]) - 1
+    return None
+
+
+def key_label(key):
+    return LABELS.get(key) or (key or "").replace("Key_", "").replace("Button_", "")
+
+
 def parse_wm_size(text):
     """Return (w, h) in natural orientation from `wm size`, preferring the override size."""
     found = dict((k.lower(), (int(w), int(h))) for k, w, h in re.findall(r"(\w+) size:\s*(\d+)x(\d+)", text))
@@ -325,7 +353,7 @@ class App:
         ttk.Scale(row, from_=0.3, to=6, variable=self.sens, length=130).pack(side="left", padx=6)
         self.land = tk.BooleanVar(value=True)
         ttk.Checkbutton(row, text="Landscape", variable=self.land).pack(side="left", padx=6)
-        ttk.Label(row, text="Camera X,Y").pack(side="left")
+        ttk.Label(row, text="Fallback cam X,Y").pack(side="left")
         self.ax = tk.StringVar(value=self.cfg.get("ax", "0.75"))
         self.ay = tk.StringVar(value=self.cfg.get("ay", "0.5"))
         ttk.Entry(row, textvariable=self.ax, width=5).pack(side="left", padx=2)
@@ -369,9 +397,9 @@ class App:
                 elif kind == "adb":
                     self.adb_label.config(text=self.adb_text())
                 elif kind == "capon":
-                    self.area.config(text=MODE_TEXT["cursor"], bg=MODE_BG["cursor"], cursor="none")
+                    self.area.config(text=MODE_TEXT["cursor"].format(k=val), bg=MODE_BG["cursor"], cursor="none")
                 elif kind == "capmode":
-                    self.area.config(text=MODE_TEXT[val], bg=MODE_BG[val])
+                    self.area.config(text=MODE_TEXT[val[0]].format(k=val[1]), bg=MODE_BG[val[0]])
                 elif kind == "capend":
                     self.area.config(text="CLICK HERE to capture the mouse\n(starts in cursor mode)",
                                      bg="#263238", cursor="hand2")
@@ -548,6 +576,7 @@ class App:
                 self.area.winfo_rooty() + self.area.winfo_height())
         self.capturing = True
         self.area.config(text="Starting touch link...")
+        self.area.focus_force()
         threading.Thread(target=self.capture_run, daemon=True,
                          args=(self.serial(), self.sens.get(), ax, ay, self.land.get(), rect)).start()
 
@@ -559,8 +588,9 @@ class App:
         lo, hi = min(sz), max(sz)
         return (hi, lo) if landscape else (lo, hi)
 
-    def load_clicks(self):
-        """Positions of Button_Left / Button_Right from the keymap on the phone (fallback: last pushed file)."""
+    def load_keymap(self):
+        """Returns (taps, aim, wheel) from the keymap on the phone (fallback: last pushed file).
+        taps: [(key, x, y)] screen fractions; aim: dict or None; wheel: dict or None."""
         tmp = os.path.join(BASE, "_keymap_tmp.json")
         paths = []
         rc, _ = self.run_adb(["pull", REMOTE_JSON, tmp])
@@ -571,12 +601,29 @@ class App:
         for p in paths:
             try:
                 with open(p, encoding="utf-8") as f:
-                    nodes = json.load(f)["keyMapNodes"]
-                return {n["key"]: (n["pos"]["x"], n["pos"]["y"]) for n in nodes
-                        if n.get("type") == "KMT_CLICK" and n.get("key") in ("Button_Left", "Button_Right")}
+                    data = json.load(f)
+                nodes = data.get("keyMapNodes", [])
+                taps = [(n["key"], n["pos"]["x"], n["pos"]["y"]) for n in nodes if n.get("type") == "KMT_CLICK"]
+                wheel = None
+                for n in nodes:
+                    if n.get("type") == "KMT_STEER_WHEEL":
+                        wheel = {"center": (n["centerPos"]["x"], n["centerPos"]["y"]),
+                                 "keys": [n["upKey"], n["leftKey"], n["downKey"], n["rightKey"]],
+                                 "off": (n.get("rightOffset", 0.07), n.get("downOffset", 0.12))}
+                        break
+                aim = None
+                mm = data.get("mouseMoveMap") or {}
+                if "range" in mm:
+                    sr = mm.get("speedRatio", {})
+                    aim = {"start": (mm["startPos"]["x"], mm["startPos"]["y"]),
+                           "speed": (sr.get("x", 2.0), sr.get("y", 2.0)),
+                           "range": (mm["range"]["w"], mm["range"]["h"]),
+                           "reset": bool(mm.get("reset", True)),
+                           "key": mm.get("aimKey", "Key_QuoteLeft")}
+                return taps, aim, wheel
             except Exception:
                 continue
-        return {}
+        return [], None, None
 
     def capture_run(self, serial, sens, ax, ay, landscape, rect):
         user32 = ctypes.windll.user32
@@ -599,34 +646,75 @@ class App:
             if not ov.start(serial):
                 self.say("Phone cursor overlay not reachable - install the newest APK and start the overlay. "
                          "Cursor mode will work but you won't see the cursor.")
-            clicks = self.load_clicks()
-            self.say(f"Screen {w}x{h}. Game-mode mouse buttons: {', '.join(clicks) or 'none (set LMB/RMB markers in the overlay)'}")
+            taps, aim, wheel = self.load_keymap()
+            if aim:
+                ax, ay = aim["start"]
+                sx = aim["speed"][0] * sens / 2.0
+                sy = aim["speed"][1] * sens / 2.0
+                xmin, xmax = max(0.0, ax - aim["range"][0] / 2), min(1.0, ax + aim["range"][0] / 2)
+                ymin, ymax = max(0.0, ay - aim["range"][1] / 2), min(1.0, ay + aim["range"][1] / 2)
+                reset = aim["reset"]
+            else:
+                sx = sy = sens
+                xmin, xmax, ymin, ymax, reset = 0.05, 0.95, 0.05, 0.95, True
+                self.say("No aim marker in the keymap - using the Camera X,Y fields (add +Aim in the overlay)")
+            aim_key = aim["key"] if aim else "Key_QuoteLeft"
+            aim_vk = vk_for(aim_key) or 0xC0
+            aim_name = key_label(aim_key)
+
+            pressed = lambda vk: vk is not None and bool(user32.GetAsyncKeyState(vk) & 0x8000)
+            binds = []
+            for i, (key, bx, by) in enumerate(taps):
+                vk = vk_for(key)
+                if vk is None or vk == aim_vk:
+                    continue
+                binds.append({"vk": vk, "pid": 20 + i, "x": bx * w, "y": by * h, "down": False, "sent": False})
+            wvk = [vk_for(k) for k in wheel["keys"]] if wheel else []
+            joy = {"dir": (0, 0), "x": 0.0, "y": 0.0}
+            if wheel:
+                jcx, jcy = wheel["center"][0] * w, wheel["center"][1] * h
+                jrx, jry = wheel["off"][0] * w, wheel["off"][1] * h
+            self.say(f"Screen {w}x{h}. Aim on/off key: {aim_name}. Tap markers: {len(binds)}. "
+                     f"Direction pad: {'yes' if wheel else 'no'}")
+
+            def release_game():
+                for bd in binds:
+                    if bd["sent"]:
+                        link.send(1, bd["pid"], bd["x"], bd["y"], w, h, 0)
+                    bd["sent"] = False
+                if joy["dir"] != (0, 0):
+                    link.send(1, 8, joy["x"], joy["y"], w, h, 0)
+                joy["dir"] = (0, 0)
+
+            def enter_game():
+                for bd in binds:
+                    bd["down"] = pressed(bd["vk"])
+                    bd["sent"] = False
+
             l, t, r, b = rect
             cx, cy = (l + r) // 2, (t + b) // 2
             clip = RECT(l, t, r, b)
             user32.ClipCursor(ctypes.byref(clip))
             user32.SetCursorPos(cx, cy)
-            self.q.put(("capon", None))
+            self.q.put(("capon", aim_name))
 
-            pressed = lambda vk: bool(user32.GetAsyncKeyState(vk) & 0x8000)
             pt = POINT()
             mode = "cursor"
             curx, cury = w / 2.0, h / 2.0           # simulated cursor position (phone px)
             cur_down = False                         # cursor-mode finger is down
             prev_lm = pressed(1)
             camx = camy = 0.0
-            down = False                             # game-mode camera finger is down
+            down = False                             # aim-mode camera finger is down
             last_move = last_sent = 0.0
             dirty = True
-            held = {"Button_Left": pressed(1), "Button_Right": pressed(2)}
-            prev_hot = pressed(0xC0)                 # ` key toggles the mode
+            prev_hot = pressed(aim_vk)
             ov.send(f"P {curx / w:.4f} {cury / h:.4f}")
 
             while self.capturing and link.alive:
                 if pressed(0x1B):
                     break
                 now = time.time()
-                hot = pressed(0xC0)
+                hot = pressed(aim_vk)
                 if hot and not prev_hot:
                     if mode == "cursor":
                         if cur_down:
@@ -634,18 +722,16 @@ class App:
                             cur_down = False
                         mode = "game"
                         ov.send("H")
-                        held = {"Button_Left": pressed(1), "Button_Right": pressed(2)}
+                        enter_game()
                     else:
                         if down:
                             link.send(1, 1, camx, camy, w, h, 0)
                             down = False
-                        for key, pid in (("Button_Left", 2), ("Button_Right", 3)):
-                            if key in clicks and held.get(key):
-                                link.send(1, pid, clicks[key][0] * w, clicks[key][1] * h, w, h, 0)
+                        release_game()
                         mode = "cursor"
                         prev_lm = pressed(1)
                         dirty = True
-                    self.q.put(("capmode", mode))
+                    self.q.put(("capmode", (mode, aim_name)))
                 prev_hot = hot
 
                 user32.GetCursorPos(ctypes.byref(pt))
@@ -655,13 +741,14 @@ class App:
                     user32.SetCursorPos(cx, cy)
 
                 if mode == "cursor":
+                    # plain mouse: a cursor on the phone, left click = tap under it (markers are NOT triggered)
                     if moved:
                         curx = max(0.0, min(w - 1.0, curx + dx * sens))
                         cury = max(0.0, min(h - 1.0, cury + dy * sens))
                         dirty = True
                         if cur_down:
                             link.send(2, 4, curx, cury, w, h)
-                    lm = pressed(1)
+                    lm = pressed(1) and aim_vk != 1
                     if lm and not prev_lm:
                         link.send(0, 4, curx, cury, w, h)
                         cur_down = True
@@ -674,30 +761,50 @@ class App:
                         dirty = False
                         last_sent = now
                 else:
+                    # aim mode: mouse = camera finger, keys/buttons trigger the markers
                     if moved:
                         if not down:
                             camx, camy = ax * w, ay * h
                             link.send(0, 1, camx, camy, w, h)
                             down = True
-                        camx += dx * sens
-                        camy += dy * sens
-                        if not (0.05 * w < camx < 0.95 * w and 0.05 * h < camy < 0.95 * h):
-                            link.send(1, 1, camx, camy, w, h, 0)
-                            camx, camy = ax * w, ay * h
-                            link.send(0, 1, camx, camy, w, h)
+                        camx += dx * sx
+                        camy += dy * sy
+                        if not (xmin * w <= camx <= xmax * w and ymin * h <= camy <= ymax * h):
+                            camx = min(max(camx, xmin * w), xmax * w)
+                            camy = min(max(camy, ymin * h), ymax * h)
+                            if reset:
+                                link.send(2, 1, camx, camy, w, h)
+                                link.send(1, 1, camx, camy, w, h, 0)
+                                camx, camy = ax * w, ay * h
+                                link.send(0, 1, camx, camy, w, h)
                         link.send(2, 1, camx, camy, w, h)
                         last_move = now
                     elif down and now - last_move > 0.25:
                         link.send(1, 1, camx, camy, w, h, 0)
                         down = False
-                    for vk, pid, key in ((1, 2, "Button_Left"), (2, 3, "Button_Right")):
-                        if key not in clicks:
-                            continue
-                        state = pressed(vk)
-                        if state != held[key]:
-                            held[key] = state
-                            link.send(0 if state else 1, pid, clicks[key][0] * w, clicks[key][1] * h, w, h,
-                                      0xFFFF if state else 0)
+                    for bd in binds:
+                        st = pressed(bd["vk"])
+                        if st != bd["down"]:
+                            bd["down"] = st
+                            if st:
+                                link.send(0, bd["pid"], bd["x"], bd["y"], w, h)
+                                bd["sent"] = True
+                            elif bd["sent"]:
+                                link.send(1, bd["pid"], bd["x"], bd["y"], w, h, 0)
+                                bd["sent"] = False
+                    if wheel:
+                        vx = int(pressed(wvk[3])) - int(pressed(wvk[1]))
+                        vy = int(pressed(wvk[2])) - int(pressed(wvk[0]))
+                        if (vx, vy) != joy["dir"]:
+                            if vx or vy:
+                                n = math.hypot(vx, vy)
+                                joy["x"], joy["y"] = jcx + vx / n * jrx, jcy + vy / n * jry
+                                if joy["dir"] == (0, 0):
+                                    link.send(0, 8, jcx, jcy, w, h)
+                                link.send(2, 8, joy["x"], joy["y"], w, h)
+                            else:
+                                link.send(1, 8, joy["x"], joy["y"], w, h, 0)
+                            joy["dir"] = (vx, vy)
                 time.sleep(0.002)
 
             # release everything that is still down
@@ -705,9 +812,8 @@ class App:
                 link.send(1, 1, camx, camy, w, h, 0)
             if cur_down:
                 link.send(1, 4, curx, cury, w, h, 0)
-            for key, pid in (("Button_Left", 2), ("Button_Right", 3)):
-                if key in clicks and held.get(key) and mode == "game":
-                    link.send(1, pid, clicks[key][0] * w, clicks[key][1] * h, w, h, 0)
+            if mode == "game":
+                release_game()
         except Exception as e:
             self.say(f"Capture error: {e}")
         finally:

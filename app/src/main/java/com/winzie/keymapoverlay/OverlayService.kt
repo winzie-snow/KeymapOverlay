@@ -12,6 +12,8 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PixelFormat
+import android.graphics.RectF
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.LocalServerSocket
 import android.os.Handler
@@ -24,7 +26,6 @@ import android.view.View
 import android.view.WindowManager
 import android.view.WindowManager.LayoutParams as LP
 import android.widget.Button
-import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -37,14 +38,72 @@ class OverlayService : Service() {
     private lateinit var wm: WindowManager
     private val markers = mutableListOf<Marker>()
     private var panel: View? = null
+    private var handle: View? = null
+    private var lockButton: Button? = null
     private var locked = false
-    private val size by lazy { (56 * resources.displayMetrics.density).toInt() }
 
-    // type: "click" or "wheel"; for wheel, keys = W,A,S,D
-    inner class Marker(val type: String, var key: String, val view: TextView, val lp: LP,
-                       var wheel: MutableList<String> = mutableListOf("Key_W", "Key_A", "Key_S", "Key_D"))
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
-    // ---- simulated mouse cursor, driven by the PC over a local socket (adb forward) ----
+    // type: "click", "wheel" (direction pad) or "aim" (mouse look)
+    inner class Marker(val type: String, var key: String, val view: View, val lp: LP,
+                       var wheel: MutableList<String> = mutableListOf("Key_W", "Key_A", "Key_S", "Key_D")) {
+        var sensX = 50
+        var sensY = 50
+        var rangeW = 0.4f
+        var rangeH = 0.6f
+        var reset = true
+        var aimKey = "Key_QuoteLeft"
+        var rangeView: View? = null
+        var rangeLp: LP? = null
+    }
+
+    // ---------- custom views ----------
+    private class WheelView(c: Context) : View(c) {
+        var labels: List<String> = listOf("W", "A", "S", "D") // up, left, down, right
+        private val bg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x66000000; style = Paint.Style.FILL }
+        private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF00B0FF.toInt(); style = Paint.Style.STROKE; strokeWidth = 8f }
+        private val pad = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x99FFFFFF.toInt(); style = Paint.Style.FILL }
+        private val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x88B0BEC5.toInt(); style = Paint.Style.FILL }
+        private val txt = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; textAlign = Paint.Align.CENTER; typeface = Typeface.DEFAULT_BOLD }
+        private val rect = RectF()
+        override fun onDraw(canvas: Canvas) {
+            val cx = width / 2f
+            val cy = height / 2f
+            val r = minOf(cx, cy) - 6f
+            canvas.drawCircle(cx, cy, r, bg)
+            canvas.drawCircle(cx, cy, r, ring)
+            val half = r * 0.30f
+            val dist = r * 0.55f
+            val dirs = arrayOf(floatArrayOf(0f, -1f), floatArrayOf(-1f, 0f), floatArrayOf(0f, 1f), floatArrayOf(1f, 0f))
+            for (i in 0 until 4) {
+                val px = cx + dirs[i][0] * dist
+                val py = cy + dirs[i][1] * dist
+                rect.set(px - half, py - half, px + half, py + half)
+                canvas.drawRoundRect(rect, half * 0.4f, half * 0.4f, pad)
+                val label = labels.getOrElse(i) { "" }
+                txt.textSize = half * (if (label.length > 2) 0.7f else 1.1f)
+                canvas.drawText(label, px, py - (txt.ascent() + txt.descent()) / 2f, txt)
+            }
+            canvas.drawCircle(cx, cy, r * 0.14f, dot)
+        }
+    }
+
+    private class AimView(c: Context) : View(c) {
+        private val bg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x553A5AFF; style = Paint.Style.FILL }
+        private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF9FB4FF.toInt(); style = Paint.Style.STROKE; strokeWidth = 4f }
+        private val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF5C6BC0.toInt(); style = Paint.Style.FILL }
+        override fun onDraw(canvas: Canvas) {
+            val cx = width / 2f
+            val cy = height / 2f
+            val r = minOf(cx, cy) - 4f
+            canvas.drawCircle(cx, cy, r, bg)
+            canvas.drawCircle(cx, cy, r, ring)
+            canvas.drawLine(cx - r, cy, cx + r, cy, ring)
+            canvas.drawLine(cx, cy - r, cx, cy + r, ring)
+            canvas.drawCircle(cx, cy, r * 0.28f, dot)
+        }
+    }
+
     private class CursorView(c: Context) : View(c) {
         private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; style = Paint.Style.FILL }
         private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.BLACK; style = Paint.Style.STROKE; strokeWidth = 3f }
@@ -59,6 +118,7 @@ class OverlayService : Service() {
         }
     }
 
+    // ---------- simulated mouse cursor, driven by the PC over a local socket (adb forward) ----------
     private val ui = Handler(Looper.getMainLooper())
     private var cursorView: CursorView? = null
     private var cursorLp: LP? = null
@@ -69,7 +129,7 @@ class OverlayService : Service() {
     @Volatile private var curPending = false
 
     private fun makeCursor() {
-        val sz = (30 * resources.displayMetrics.density).toInt()
+        val sz = dp(30)
         val v = CursorView(this)
         v.visibility = View.GONE
         val lp = LP(sz, sz, LP.TYPE_APPLICATION_OVERLAY, baseFlags() or LP.FLAG_NOT_TOUCHABLE, PixelFormat.TRANSLUCENT)
@@ -90,8 +150,7 @@ class OverlayService : Service() {
         lp.x = (curX * m.widthPixels).toInt()
         lp.y = (curY * m.heightPixels).toInt()
         if (v.visibility != View.VISIBLE) {
-            // re-add so the cursor sits above every marker
-            runCatching { wm.removeView(v) }
+            runCatching { wm.removeView(v) } // re-add so the cursor sits above every marker
             v.visibility = View.VISIBLE
             wm.addView(v, lp)
         } else {
@@ -147,17 +206,18 @@ class OverlayService : Service() {
 
     override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
         when (i?.action) {
-            "RELOAD" -> { markers.forEach { runCatching { wm.removeView(it.view) } }; markers.clear(); loadExisting() }
-            "LOCK" -> { locked = true; applyLock() }
-            "EDIT" -> { locked = false; applyLock() }
+            "RELOAD" -> { ArrayList(markers).forEach { removeMarker(it) }; loadExisting() }
+            "LOCK" -> { setLocked(true); setPanelHidden(true) }
+            "EDIT" -> { setLocked(false); setPanelHidden(false) }
             "STOP" -> stopSelf()
         }
         return START_NOT_STICKY
     }
 
     override fun onDestroy() {
-        markers.forEach { runCatching { wm.removeView(it.view) } }
+        ArrayList(markers).forEach { removeMarker(it) }
         panel?.let { runCatching { wm.removeView(it) } }
+        handle?.let { runCatching { wm.removeView(it) } }
         cursorView?.let { runCatching { wm.removeView(it) } }
         runCatching { cursorServer?.close() }
         super.onDestroy()
@@ -167,63 +227,147 @@ class OverlayService : Service() {
 
     private fun baseFlags() = LP.FLAG_NOT_FOCUSABLE or LP.FLAG_LAYOUT_NO_LIMITS or LP.FLAG_LAYOUT_IN_SCREEN
 
+    // ---------- toolbar with hide / show bar ----------
     private fun showPanel() {
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setBackgroundColor(0xCC000000.toInt()) }
-        fun btn(t: String, f: (Button) -> Unit) = Button(this).apply {
-            text = t; textSize = 11f; setOnClickListener { f(this) }
-        }.also { row.addView(it, LinearLayout.LayoutParams(-2, -2)) }
+        fun btn(t: String, f: (Button) -> Unit): Button = Button(this).apply {
+            text = t; textSize = 11f; setAllCaps(false); minWidth = 0; minimumWidth = 0
+            setPadding(dp(10), 0, dp(10), 0); setOnClickListener { f(this) }
+        }.also { row.addView(it, LinearLayout.LayoutParams(-2, dp(40))) }
         btn("+Tap") { addMarker("click", "Key_R", 0.5f, 0.5f) }
-        btn("+Wheel") { if (markers.none { it.type == "wheel" }) addMarker("wheel", "WASD", 0.17f, 0.72f) }
+        btn("+Dir") { if (markers.none { it.type == "wheel" }) addMarker("wheel", "", 0.17f, 0.72f, dp(140)) }
+        btn("+Aim") { if (markers.none { it.type == "aim" }) addMarker("aim", "", 0.75f, 0.5f, dp(56)) }
         btn("Save") { save() }
-        btn("Lock") { b -> locked = !locked; b.text = if (locked) "Edit" else "Lock"; applyLock() }
+        lockButton = btn("Lock") { setLocked(!locked) }
+        btn("Hide") { setPanelHidden(true) }
         btn("X") { stopSelf() }
         val lp = LP(-2, -2, LP.TYPE_APPLICATION_OVERLAY, baseFlags(), PixelFormat.TRANSLUCENT)
         lp.gravity = Gravity.TOP or Gravity.START; lp.x = 0; lp.y = 0
         wm.addView(row, lp); panel = row
+
+        // small bar shown while the toolbar is hidden: tap it to bring the menu back
+        val bar = View(this).apply {
+            background = GradientDrawable().apply {
+                cornerRadius = dp(8).toFloat(); setColor(0xDDFFFFFF.toInt()); setStroke(dp(1), 0x99000000.toInt())
+            }
+            setOnClickListener { setPanelHidden(false) }
+        }
+        val blp = LP(dp(72), dp(16), LP.TYPE_APPLICATION_OVERLAY, baseFlags(), PixelFormat.TRANSLUCENT)
+        blp.gravity = Gravity.TOP or Gravity.START; blp.x = dp(8); blp.y = dp(2)
+        bar.visibility = View.GONE
+        wm.addView(bar, blp); handle = bar
+    }
+
+    private fun setPanelHidden(hidden: Boolean) {
+        panel?.visibility = if (hidden) View.GONE else View.VISIBLE
+        handle?.visibility = if (hidden) View.VISIBLE else View.GONE
+    }
+
+    private fun setLocked(on: Boolean) {
+        locked = on
+        lockButton?.text = if (on) "Edit" else "Lock"
+        applyLock()
     }
 
     private fun applyLock() {
         markers.forEach {
             it.lp.flags = if (locked) baseFlags() or LP.FLAG_NOT_TOUCHABLE else baseFlags()
             it.view.alpha = if (locked) 0.35f else 0.85f
+            it.rangeView?.alpha = if (locked) 0.25f else 1f
             wm.updateViewLayout(it.view, it.lp)
         }
     }
 
-    private fun addMarker(type: String, key: String, fx: Float, fy: Float): Marker {
+    // ---------- markers ----------
+    private fun addMarker(type: String, key: String, fx: Float, fy: Float, sizePx: Int = dp(56)): Marker {
         val m = real()
-        val tv = TextView(this).apply {
-            text = if (type == "wheel") "MOVE" else labelFor(key)
-            setTextColor(Color.WHITE); gravity = Gravity.CENTER; textSize = 12f; alpha = 0.85f
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(if (type == "wheel") 0xAA2979FF.toInt() else 0xAAE53935.toInt())
-                setStroke(3, Color.WHITE)
+        val view: View = when (type) {
+            "wheel" -> WheelView(this)
+            "aim" -> AimView(this)
+            else -> TextView(this).apply {
+                text = labelFor(key)
+                setTextColor(Color.WHITE); gravity = Gravity.CENTER; textSize = 12f
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(0xAAE53935.toInt()); setStroke(3, Color.WHITE)
+                }
             }
         }
-        val lp = LP(size, size, LP.TYPE_APPLICATION_OVERLAY, baseFlags(), PixelFormat.TRANSLUCENT)
+        view.alpha = 0.85f
+        val lp = LP(sizePx, sizePx, LP.TYPE_APPLICATION_OVERLAY, baseFlags(), PixelFormat.TRANSLUCENT)
         lp.gravity = Gravity.TOP or Gravity.START
-        lp.x = (fx * m.widthPixels - size / 2).toInt()
-        lp.y = (fy * m.heightPixels - size / 2).toInt()
-        val mk = Marker(type, key, tv, lp)
+        lp.x = (fx * m.widthPixels - sizePx / 2).toInt()
+        lp.y = (fy * m.heightPixels - sizePx / 2).toInt()
+        val mk = Marker(type, key, view, lp)
+        if (type == "aim") {
+            // the range rectangle is its own window, added first so the aim marker sits on top of it
+            val rv = View(this).apply {
+                background = GradientDrawable().apply { setColor(0x22FFFFFF); setStroke(dp(2), 0xAAFFFFFF.toInt()) }
+            }
+            val rlp = LP(dp(100), dp(100), LP.TYPE_APPLICATION_OVERLAY, baseFlags() or LP.FLAG_NOT_TOUCHABLE, PixelFormat.TRANSLUCENT)
+            rlp.gravity = Gravity.TOP or Gravity.START
+            wm.addView(rv, rlp)
+            mk.rangeView = rv; mk.rangeLp = rlp
+        }
         var dx = 0f; var dy = 0f; var sx = 0; var sy = 0; var moved = false
-        tv.setOnTouchListener { _, e ->
+        view.setOnTouchListener { _, e ->
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> { dx = e.rawX; dy = e.rawY; sx = lp.x; sy = lp.y; moved = false }
                 MotionEvent.ACTION_MOVE -> {
                     if (Math.abs(e.rawX - dx) > 10 || Math.abs(e.rawY - dy) > 10) moved = true
-                    if (moved) { lp.x = sx + (e.rawX - dx).toInt(); lp.y = sy + (e.rawY - dy).toInt(); wm.updateViewLayout(tv, lp) }
+                    if (moved) {
+                        lp.x = sx + (e.rawX - dx).toInt(); lp.y = sy + (e.rawY - dy).toInt()
+                        wm.updateViewLayout(view, lp)
+                        if (mk.type == "aim") syncRange(mk)
+                    }
                 }
                 MotionEvent.ACTION_UP -> if (!moved) editMarker(mk)
             }
             true
         }
-        wm.addView(tv, lp); markers.add(mk)
+        wm.addView(view, lp)
+        markers.add(mk)
+        if (type == "wheel") refreshWheel(mk)
+        if (type == "aim") syncRange(mk)
         return mk
     }
 
-    // ---- key picker ----
-    private val KEYS_MOUSE = listOf("LMB" to "Button_Left", "RMB" to "Button_Right", "MMB" to "Button_Middle")
+    private fun removeMarker(mk: Marker) {
+        runCatching { wm.removeView(mk.view) }
+        mk.rangeView?.let { runCatching { wm.removeView(it) } }
+        markers.remove(mk)
+    }
+
+    private fun syncRange(mk: Marker) {
+        val rv = mk.rangeView ?: return
+        val rl = mk.rangeLp ?: return
+        val m = real()
+        val cx = mk.lp.x + mk.lp.width / 2
+        val cy = mk.lp.y + mk.lp.height / 2
+        rl.width = (mk.rangeW * m.widthPixels).toInt().coerceAtLeast(dp(40))
+        rl.height = (mk.rangeH * m.heightPixels).toInt().coerceAtLeast(dp(40))
+        rl.x = cx - rl.width / 2
+        rl.y = cy - rl.height / 2
+        wm.updateViewLayout(rv, rl)
+    }
+
+    private fun refreshWheel(mk: Marker) {
+        val v = mk.view as? WheelView ?: return
+        v.labels = mk.wheel.map { labelFor(it) }
+        v.invalidate()
+    }
+
+    private fun setWheelSize(mk: Marker, px: Int) {
+        val cx = mk.lp.x + mk.lp.width / 2
+        val cy = mk.lp.y + mk.lp.height / 2
+        mk.lp.width = px; mk.lp.height = px
+        mk.lp.x = cx - px / 2; mk.lp.y = cy - px / 2
+        wm.updateViewLayout(mk.view, mk.lp)
+    }
+
+    // ---------- key picker ----------
+    private val KEYS_MOUSE = listOf("LMB" to "Button_Left", "RMB" to "Button_Right", "MMB" to "Button_Middle",
+        "M4" to "Button_Back", "M5" to "Button_Forward")
     private val KEYS_SPECIAL = listOf("Space" to "Key_Space", "Shift" to "Key_Shift", "Ctrl" to "Key_Control",
         "Alt" to "Key_Alt", "Tab" to "Key_Tab", "Esc" to "Key_Escape", "Enter" to "Key_Return",
         "\u2191" to "Key_Up", "\u2193" to "Key_Down", "\u2190" to "Key_Left", "\u2192" to "Key_Right")
@@ -245,10 +389,10 @@ class OverlayService : Service() {
     private fun theme() = android.R.style.Theme_Material_Light_Dialog_Alert
 
     private fun keySection(title: String, items: List<Pair<String, String>>, onPick: (Pair<String, String>) -> Unit): View {
-        val cell = (58 * resources.displayMetrics.density).toInt()
+        val cell = dp(58)
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         box.addView(TextView(this).apply {
-            text = title; setPadding(8, 20, 8, 4); setTypeface(typeface, android.graphics.Typeface.BOLD)
+            text = title; setPadding(8, 20, 8, 4); setTypeface(typeface, Typeface.BOLD)
         })
         val grid = android.widget.GridLayout(this).apply { columnCount = 5 }
         for (kv in items) {
@@ -276,11 +420,32 @@ class OverlayService : Service() {
         dlg = overlayDialog(b)
     }
 
+    private fun stepper(parent: LinearLayout, label: String, getV: () -> Int, setV: (Int) -> Unit,
+                        step: Int, min: Int, max: Int) {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, dp(4), 0, dp(4))
+        }
+        row.addView(TextView(this).apply { text = label }, LinearLayout.LayoutParams(0, -2, 1f))
+        val value = TextView(this).apply { text = getV().toString(); gravity = Gravity.CENTER; minWidth = dp(60) }
+        fun bump(d: Int) { setV((getV() + d * step).coerceIn(min, max)); value.text = getV().toString() }
+        row.addView(Button(this).apply {
+            text = "-"; minWidth = 0; minimumWidth = 0; setOnClickListener { bump(-1) }
+        }, LinearLayout.LayoutParams(dp(48), dp(44)))
+        row.addView(value)
+        row.addView(Button(this).apply {
+            text = "+"; minWidth = 0; minimumWidth = 0; setOnClickListener { bump(1) }
+        }, LinearLayout.LayoutParams(dp(48), dp(44)))
+        parent.addView(row)
+    }
+
     private fun editMarker(mk: Marker) {
-        val del = { wm.removeView(mk.view); markers.remove(mk); Unit }
-        if (mk.type == "wheel") { editWheel(mk, del); return }
-        pickKey("Pick the button for this marker", del) { code ->
-            mk.key = code; mk.view.text = labelFor(code)
+        val del = { removeMarker(mk) }
+        when (mk.type) {
+            "wheel" -> editWheel(mk, del)
+            "aim" -> editAim(mk, del)
+            else -> pickKey("Pick the button for this marker", del) { code ->
+                mk.key = code; (mk.view as TextView).text = labelFor(code)
+            }
         }
     }
 
@@ -297,7 +462,7 @@ class OverlayService : Service() {
         for ((name, keys) in map) {
             presets.addView(Button(this).apply {
                 text = name; textSize = 12f; setAllCaps(false)
-                setOnClickListener { mk.wheel = keys.toMutableList(); dlg?.dismiss(); editWheel(mk, del) }
+                setOnClickListener { mk.wheel = keys.toMutableList(); refreshWheel(mk); dlg?.dismiss(); editWheel(mk, del) }
             })
         }
         col.addView(presets)
@@ -308,41 +473,94 @@ class OverlayService : Service() {
                 text = names[i] + ": " + labelFor(mk.wheel[i]); setAllCaps(false)
                 setOnClickListener {
                     dlg?.dismiss()
-                    pickKey("Key for " + names[i]) { code -> mk.wheel[i] = code; editWheel(mk, del) }
+                    pickKey("Key for " + names[i]) { code -> mk.wheel[i] = code; refreshWheel(mk); editWheel(mk, del) }
                 }
             })
         }
-        val b = AlertDialog.Builder(this, theme()).setTitle("Movement keys")
+        stepper(col, "Size (dp)", { (mk.lp.width / resources.displayMetrics.density).toInt() },
+            { setWheelSize(mk, dp(it)) }, 10, 80, 300)
+        val b = AlertDialog.Builder(this, theme()).setTitle("Direction keys")
             .setView(ScrollView(this).apply { addView(col) })
             .setPositiveButton("Done", null).setNeutralButton("Delete") { _, _ -> del() }
         dlg = overlayDialog(b)
     }
 
-    private fun fx(mk: Marker, w: Int) = ((mk.lp.x + size / 2f) / w)
-    private fun fy(mk: Marker, h: Int) = ((mk.lp.y + size / 2f) / h)
-    private fun pt(x: Float, y: Float) = JSONObject().put("x", "%.4f".format(x).toDouble()).put("y", "%.4f".format(y).toDouble())
+    private fun editAim(mk: Marker, del: () -> Unit) {
+        val m = real()
+        var dlg: AlertDialog? = null
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 12, 24, 12) }
+        col.addView(Button(this).apply {
+            text = "Aim on/off key: " + labelFor(mk.aimKey); setAllCaps(false)
+            setOnClickListener {
+                dlg?.dismiss()
+                pickKey("Key that toggles aim mode") { code -> mk.aimKey = code; editAim(mk, del) }
+            }
+        })
+        col.addView(TextView(this).apply {
+            text = "Press it on the PC to switch between the cursor and aim mode."
+            textSize = 11f; setPadding(0, 0, 0, dp(8))
+        })
+        stepper(col, "X-axis sensitivity", { mk.sensX }, { mk.sensX = it }, 5, 5, 200)
+        stepper(col, "Y-axis sensitivity", { mk.sensY }, { mk.sensY = it }, 5, 5, 200)
+        stepper(col, "X-axis range (px)", { (mk.rangeW * m.widthPixels).toInt() },
+            { mk.rangeW = it / m.widthPixels.toFloat(); syncRange(mk) }, 20, 100, m.widthPixels)
+        stepper(col, "Y-axis range (px)", { (mk.rangeH * m.heightPixels).toInt() },
+            { mk.rangeH = it / m.heightPixels.toFloat(); syncRange(mk) }, 20, 100, m.heightPixels)
+        col.addView(android.widget.Switch(this).apply {
+            text = "Reset"; isChecked = mk.reset; setPadding(0, dp(8), 0, 0)
+            setOnCheckedChangeListener { _, c -> mk.reset = c }
+        })
+        col.addView(TextView(this).apply {
+            text = "If enabled, the camera finger lifts and restarts at the center when the mouse moves out of range."
+            textSize = 11f
+        })
+        val b = AlertDialog.Builder(this, theme()).setTitle("Aim key settings")
+            .setView(ScrollView(this).apply { addView(col) })
+            .setPositiveButton("Done", null).setNeutralButton("Delete") { _, _ -> del() }
+        dlg = overlayDialog(b)
+    }
+
+    // ---------- save / load ----------
+    private fun fx(mk: Marker, w: Int) = (mk.lp.x + mk.lp.width / 2f) / w
+    private fun fy(mk: Marker, h: Int) = (mk.lp.y + mk.lp.height / 2f) / h
+    private fun r4(v: Number) = Math.round(v.toDouble() * 10000) / 10000.0
+    private fun pt(x: Float, y: Float) = JSONObject().put("x", r4(x)).put("y", r4(y))
 
     private fun file() = File(getExternalFilesDir(null), "keymap.json")
 
     private fun save() {
         val m = real()
         val nodes = JSONArray()
+        var aim: Marker? = null
         for (mk in markers) {
-            val x = fx(mk, m.widthPixels); val y = fy(mk, m.heightPixels)
-            if (mk.type == "wheel") {
-                nodes.put(JSONObject().put("type", "KMT_STEER_WHEEL").put("centerPos", pt(x, y))
-                    .put("upKey", mk.wheel[0]).put("leftKey", mk.wheel[1])
-                    .put("downKey", mk.wheel[2]).put("rightKey", mk.wheel[3])
-                    .put("leftOffset", 0.1).put("rightOffset", 0.1).put("upOffset", 0.1).put("downOffset", 0.1))
-            } else {
-                nodes.put(JSONObject().put("type", "KMT_CLICK").put("key", mk.key)
+            val x = fx(mk, m.widthPixels)
+            val y = fy(mk, m.heightPixels)
+            when (mk.type) {
+                "wheel" -> {
+                    val rad = mk.lp.width / 2f
+                    val ox = r4(rad / m.widthPixels)
+                    val oy = r4(rad / m.heightPixels)
+                    nodes.put(JSONObject().put("type", "KMT_STEER_WHEEL").put("centerPos", pt(x, y))
+                        .put("upKey", mk.wheel[0]).put("leftKey", mk.wheel[1])
+                        .put("downKey", mk.wheel[2]).put("rightKey", mk.wheel[3])
+                        .put("leftOffset", ox).put("rightOffset", ox).put("upOffset", oy).put("downOffset", oy))
+                }
+                "aim" -> aim = mk
+                else -> nodes.put(JSONObject().put("type", "KMT_CLICK").put("key", mk.key)
                     .put("pos", pt(x, y)).put("switchMap", false))
             }
         }
-        val root = JSONObject().put("switchKey", "Key_QuoteLeft")
-            .put("mouseMoveMap", JSONObject().put("startPos", pt(0.5f, 0.5f))
-                .put("speedRatio", JSONObject().put("x", 2.0).put("y", 2.0)))
-            .put("keyMapNodes", nodes)
+        val mm = JSONObject()
+        if (aim != null) {
+            mm.put("startPos", pt(fx(aim, m.widthPixels), fy(aim, m.heightPixels)))
+                .put("speedRatio", JSONObject().put("x", r4(aim.sensX / 25.0)).put("y", r4(aim.sensY / 25.0)))
+                .put("range", JSONObject().put("w", r4(aim.rangeW)).put("h", r4(aim.rangeH)))
+                .put("reset", aim.reset).put("aimKey", aim.aimKey)
+        } else {
+            mm.put("startPos", pt(0.5f, 0.5f))
+                .put("speedRatio", JSONObject().put("x", 2.0).put("y", 2.0))
+        }
+        val root = JSONObject().put("switchKey", "Key_QuoteLeft").put("mouseMoveMap", mm).put("keyMapNodes", nodes)
         file().writeText(root.toString(2))
         Toast.makeText(this, "Saved ${file().absolutePath}", Toast.LENGTH_LONG).show()
     }
@@ -350,17 +568,37 @@ class OverlayService : Service() {
     private fun loadExisting() {
         val f = file(); if (!f.exists()) return
         runCatching {
-            val arr = JSONObject(f.readText()).getJSONArray("keyMapNodes")
+            val root = JSONObject(f.readText())
+            val m = real()
+            val arr = root.getJSONArray("keyMapNodes")
             for (i in 0 until arr.length()) {
                 val n = arr.getJSONObject(i)
                 if (n.getString("type") == "KMT_STEER_WHEEL") {
                     val c = n.getJSONObject("centerPos")
-                    addMarker("wheel", "WASD", c.getDouble("x").toFloat(), c.getDouble("y").toFloat()).wheel =
-                        mutableListOf(n.getString("upKey"), n.getString("leftKey"), n.getString("downKey"), n.getString("rightKey"))
+                    val rad = n.optDouble("rightOffset", 0.07) * m.widthPixels
+                    val sz = (rad * 2).toInt().coerceIn(dp(80), dp(260))
+                    val mk = addMarker("wheel", "", c.getDouble("x").toFloat(), c.getDouble("y").toFloat(), sz)
+                    mk.wheel = mutableListOf(n.getString("upKey"), n.getString("leftKey"),
+                        n.getString("downKey"), n.getString("rightKey"))
+                    refreshWheel(mk)
                 } else if (n.getString("type") == "KMT_CLICK") {
                     val p = n.getJSONObject("pos")
                     addMarker("click", n.getString("key"), p.getDouble("x").toFloat(), p.getDouble("y").toFloat())
                 }
+            }
+            val mm = root.optJSONObject("mouseMoveMap")
+            if (mm != null && mm.has("range")) {
+                val sp = mm.getJSONObject("startPos")
+                val rg = mm.getJSONObject("range")
+                val sr = mm.optJSONObject("speedRatio")
+                val mk = addMarker("aim", "", sp.getDouble("x").toFloat(), sp.getDouble("y").toFloat(), dp(56))
+                mk.rangeW = rg.getDouble("w").toFloat()
+                mk.rangeH = rg.getDouble("h").toFloat()
+                mk.sensX = ((sr?.optDouble("x", 2.0) ?: 2.0) * 25).toInt()
+                mk.sensY = ((sr?.optDouble("y", 2.0) ?: 2.0) * 25).toInt()
+                mk.reset = mm.optBoolean("reset", true)
+                mk.aimKey = mm.optString("aimKey", "Key_QuoteLeft")
+                syncRange(mk)
             }
         }
     }
