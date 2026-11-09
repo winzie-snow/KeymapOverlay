@@ -21,7 +21,6 @@ AIM_KEY = "Key_QuoteLeft"   # the ` key on the PC always toggles cursor <-> aim 
 JOY_SLIDE = 0.07            # seconds for the direction finger to slide from the centre to the rim
 AIM_GAP = 0.03              # seconds the camera finger stays lifted when it hits the range edge
 AIM_SETTLE = 0.012          # seconds after touch-down before the camera finger starts moving
-AIM_IDLE = 0.15             # seconds without mouse movement before the camera finger is lifted
 JOY_STEP = 0.006           # minimum seconds between two direction move events
 SERVER_VER = "5.0.1"
 SERVER_URL = f"https://github.com/Genymobile/scrcpy/releases/download/v{SERVER_VER}/scrcpy-server-v{SERVER_VER}"
@@ -838,12 +837,15 @@ class App:
                         last_sent = now
                 else:
                     # aim mode: mouse = camera finger, keys/buttons trigger the markers
-                    if moved and now >= gap_until:
-                        if not down:
-                            camx, camy = ax * w, ay * h
-                            link.send(0, 1, camx, camy, w, h)
-                            down = True
-                            down_time = now
+                    # the camera finger is HELD DOWN automatically at the aim point for as long as aim mode is on;
+                    # moving the mouse just slides it (like keeping a finger pressed on the screen)
+                    if not down and now >= gap_until:
+                        camx, camy = ax * w, ay * h
+                        link.send(0, 1, camx, camy, w, h)
+                        down = True
+                        down_time = now
+                        ov.send(f"P {camx / w:.4f} {camy / h:.4f}")
+                    if moved and down:
                         camx += dx * sx
                         camy += dy * sy
                         if not (xmin * w <= camx <= xmax * w and ymin * h <= camy <= ymax * h):
@@ -851,23 +853,17 @@ class App:
                             camy = min(max(camy, ymin * h), ymax * h)
                             link.send(2, 1, camx, camy, w, h)
                             if reset:
-                                # lift at the edge, and only touch down again at the point after a short gap,
+                                # lift at the edge; the finger is pressed again at the aim point after a short gap,
                                 # so the game sees a clean new drag instead of a huge jump back to the centre
                                 link.send(1, 1, camx, camy, w, h, 0)
                                 down = False
                                 gap_until = now + AIM_GAP
-                                ov.send("H")
                         elif now - down_time >= AIM_SETTLE:
                             link.send(2, 1, camx, camy, w, h)
-                        last_move = now
                         if down and now - last_sent >= 0.016:
                             # debug aid: the phone shows the cursor arrow exactly where the camera finger is
                             ov.send(f"P {camx / w:.4f} {camy / h:.4f}")
                             last_sent = now
-                    elif down and now - last_move > AIM_IDLE:
-                        link.send(1, 1, camx, camy, w, h, 0)
-                        down = False
-                        ov.send("H")
                     for bd in binds:
                         st = pressed(bd["vk"])
                         if st != bd["down"]:
