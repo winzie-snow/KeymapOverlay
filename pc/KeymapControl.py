@@ -19,7 +19,10 @@ MODE_TEXT = {
 MODE_BG = {"cursor": "#0d47a1", "game": "#1b5e20"}
 AIM_KEY = "Key_QuoteLeft"   # the ` key on the PC always toggles cursor <-> aim mode
 JOY_SLIDE = 0.07            # seconds for the direction finger to slide from the centre to the rim
-JOY_STEP = 0.006            # minimum seconds between two direction move events
+AIM_GAP = 0.03              # seconds the camera finger stays lifted when it hits the range edge
+AIM_SETTLE = 0.012          # seconds after touch-down before the camera finger starts moving
+AIM_IDLE = 0.15             # seconds without mouse movement before the camera finger is lifted
+JOY_STEP = 0.006           # minimum seconds between two direction move events
 SERVER_VER = "5.0.1"
 SERVER_URL = f"https://github.com/Genymobile/scrcpy/releases/download/v{SERVER_VER}/scrcpy-server-v{SERVER_VER}"
 SERVER_JAR = os.path.join(BASE, "scrcpy-server.jar")
@@ -777,6 +780,7 @@ class App:
             camx = camy = 0.0
             down = False                             # aim-mode camera finger is down
             last_move = last_sent = 0.0
+            gap_until = down_time = 0.0              # aim finger: re-touch gap after a range reset / settle time
             dirty = True
             prev_hot = pressed(aim_vk)
             ov.send(f"P {curx / w:.4f} {cury / h:.4f}")
@@ -834,24 +838,28 @@ class App:
                         last_sent = now
                 else:
                     # aim mode: mouse = camera finger, keys/buttons trigger the markers
-                    if moved:
+                    if moved and now >= gap_until:
                         if not down:
                             camx, camy = ax * w, ay * h
                             link.send(0, 1, camx, camy, w, h)
                             down = True
+                            down_time = now
                         camx += dx * sx
                         camy += dy * sy
                         if not (xmin * w <= camx <= xmax * w and ymin * h <= camy <= ymax * h):
                             camx = min(max(camx, xmin * w), xmax * w)
                             camy = min(max(camy, ymin * h), ymax * h)
+                            link.send(2, 1, camx, camy, w, h)
                             if reset:
-                                link.send(2, 1, camx, camy, w, h)
+                                # lift at the edge, and only touch down again at the point after a short gap,
+                                # so the game sees a clean new drag instead of a huge jump back to the centre
                                 link.send(1, 1, camx, camy, w, h, 0)
-                                camx, camy = ax * w, ay * h
-                                link.send(0, 1, camx, camy, w, h)
-                        link.send(2, 1, camx, camy, w, h)
+                                down = False
+                                gap_until = now + AIM_GAP
+                        elif now - down_time >= AIM_SETTLE:
+                            link.send(2, 1, camx, camy, w, h)
                         last_move = now
-                    elif down and now - last_move > 0.25:
+                    elif down and now - last_move > AIM_IDLE:
                         link.send(1, 1, camx, camy, w, h, 0)
                         down = False
                     for bd in binds:

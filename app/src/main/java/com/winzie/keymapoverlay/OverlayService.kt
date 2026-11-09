@@ -290,6 +290,9 @@ class OverlayService : Service() {
     }
 
     private fun setLocked(on: Boolean) {
+        // locking from edit mode saves first, so the PC always uses exactly what is on screen
+        // (resized range box, moved markers) even if Save was never tapped
+        if (on && !locked && markers.isNotEmpty()) save()
         locked = on
         lockButton?.text = if (on) "Edit" else "Lock"
         applyLock()
