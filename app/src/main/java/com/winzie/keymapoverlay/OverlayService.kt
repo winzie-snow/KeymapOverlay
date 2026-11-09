@@ -42,6 +42,8 @@ class OverlayService : Service() {
     private var handle: View? = null
     private var lockButton: Button? = null
     private var locked = false
+    private var hideAll = false              // hide every button/pad while playing (locked); the center crosshair stays
+    private var hideAllButton: Button? = null
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -54,6 +56,9 @@ class OverlayService : Service() {
         var rangeH = 0.6f
         var reset = true
         var hideBox = false            // hide the range box while locked (playing)
+        var centerCross = true         // fixed crosshair at the middle of the screen
+        var centerView: View? = null
+        var centerLp: LP? = null
         var alpha = 0.6f               // button opacity, 0.1 .. 1.0
         var rangeView: View? = null
         var rangeLp: LP? = null
@@ -118,6 +123,26 @@ class OverlayService : Service() {
             canvas.drawLine(cx - r, cy, cx + r, cy, ring)
             canvas.drawLine(cx, cy - r, cx, cy + r, ring)
             canvas.drawCircle(cx, cy, r * 0.28f, dot)
+        }
+    }
+
+    // fixed crosshair for the middle of the screen (the aim pad itself stays where the camera finger touches)
+    private class CenterCrossView(c: Context) : View(c) {
+        private val outline = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xAA000000.toInt(); style = Paint.Style.STROKE; strokeWidth = 7f; strokeCap = Paint.Cap.ROUND }
+        private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = 3f; strokeCap = Paint.Cap.ROUND }
+        private val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFFF5252.toInt(); style = Paint.Style.FILL }
+        override fun onDraw(canvas: Canvas) {
+            val cx = width / 2f
+            val cy = height / 2f
+            val r = minOf(cx, cy) - 4f
+            val g = r * 0.28f
+            for (p in arrayOf(outline, line)) {
+                canvas.drawLine(cx - r, cy, cx - g, cy, p)
+                canvas.drawLine(cx + g, cy, cx + r, cy, p)
+                canvas.drawLine(cx, cy - r, cx, cy - g, p)
+                canvas.drawLine(cx, cy + g, cx, cy + r, p)
+            }
+            canvas.drawCircle(cx, cy, 3.5f, dot)
         }
     }
 
@@ -279,6 +304,7 @@ class OverlayService : Service() {
         btn("+Aim") { if (markers.none { it.type == "aim" }) addMarker("aim", "", 0.75f, 0.5f, dp(56)) }
         btn("Save") { save() }
         lockButton = btn("Lock") { setLocked(!locked) }
+        hideAllButton = btn(if (hideAll) "Show btns" else "Hide btns") { setHideAll(!hideAll) }
         btn("Hide") { setPanelHidden(true) }
         btn("X") { stopSelf() }
         val lp = LP(-2, -2, LP.TYPE_APPLICATION_OVERLAY, baseFlags(), PixelFormat.TRANSLUCENT)
@@ -314,15 +340,27 @@ class OverlayService : Service() {
 
     private fun applyLock() = markers.forEach { applyMarkerState(it) }
 
+    // "Hide btns": while locked, no button, direction pad, aim pad or range box is drawn (Edit mode always shows them)
+    private fun setHideAll(on: Boolean) {
+        hideAll = on
+        hideAllButton?.text = if (on) "Show btns" else "Hide btns"
+        applyLock()
+        save(true)
+        if (on && !locked) Toast.makeText(this, "Buttons will be hidden once you tap Lock", Toast.LENGTH_SHORT).show()
+    }
+
     // lock state + opacity for one marker (also used right after a marker is created, so a RELOAD while
     // locked never leaves touchable markers that would swallow the injected touches)
     private fun applyMarkerState(mk: Marker) {
         val flags = if (locked) baseFlags() or LP.FLAG_NOT_TOUCHABLE else baseFlags()
         mk.lp.flags = flags
+        val hidden = locked && hideAll
         mk.view.alpha = mk.alpha
+        mk.view.visibility = if (hidden) View.GONE else View.VISIBLE
         wm.updateViewLayout(mk.view, mk.lp)
         mk.rangeView?.alpha = if (locked) mk.alpha * 0.4f else mk.alpha
-        mk.rangeView?.visibility = if (locked && mk.hideBox) View.GONE else View.VISIBLE
+        mk.rangeView?.visibility = if (hidden || (locked && mk.hideBox)) View.GONE else View.VISIBLE
+        mk.centerView?.visibility = if (mk.centerCross) View.VISIBLE else View.GONE
         (mk.view as? AimView)?.crosshairOnly = locked
         if (mk.type == "aim") {
             // while playing, keep every aim window at <= 0.75 window opacity: Android 12+ blocks touches that
@@ -371,6 +409,15 @@ class OverlayService : Service() {
             rlp.gravity = Gravity.TOP or Gravity.START
             wm.addView(rv, rlp)
             mk.rangeView = rv; mk.rangeLp = rlp
+            // fixed crosshair in the middle of the screen (non-touchable, window opacity kept <= 0.75)
+            val csz = dp(44)
+            val cv = CenterCrossView(this)
+            val clp = LP(csz, csz, LP.TYPE_APPLICATION_OVERLAY, baseFlags() or LP.FLAG_NOT_TOUCHABLE, PixelFormat.TRANSLUCENT)
+            clp.gravity = Gravity.TOP or Gravity.START
+            clp.x = (m.widthPixels - csz) / 2; clp.y = (m.heightPixels - csz) / 2
+            clp.alpha = 0.75f
+            wm.addView(cv, clp)
+            mk.centerView = cv; mk.centerLp = clp
         }
         var dx = 0f; var dy = 0f; var sx = 0; var sy = 0; var moved = false
         view.setOnTouchListener { _, e ->
@@ -452,6 +499,7 @@ class OverlayService : Service() {
     private fun removeMarker(mk: Marker) {
         runCatching { wm.removeView(mk.view) }
         mk.rangeView?.let { runCatching { wm.removeView(it) } }
+        mk.centerView?.let { runCatching { wm.removeView(it) } }
         mk.grip?.let { runCatching { wm.removeView(it) } }
         markers.remove(mk)
     }
@@ -656,15 +704,16 @@ class OverlayService : Service() {
                 "Drag the round handle on the range box to resize it."
             textSize = 11f; setPadding(0, 0, 0, dp(8))
         })
-        stepper(col, "X-axis sensitivity", { mk.sensX }, { mk.sensX = it }, 5, 5, 200)
-        stepper(col, "Y-axis sensitivity", { mk.sensY }, { mk.sensY = it }, 5, 5, 200)
+        // every change is written to keymap.json right away (the PC picks it up live), no Save/Lock needed
+        stepper(col, "X-axis sensitivity", { mk.sensX }, { mk.sensX = it; save(true) }, 5, 5, 200)
+        stepper(col, "Y-axis sensitivity", { mk.sensY }, { mk.sensY = it; save(true) }, 5, 5, 200)
         stepper(col, "X-axis range (px)", { (mk.rangeW * m.widthPixels).toInt() },
-            { mk.rangeW = it / m.widthPixels.toFloat(); syncRange(mk) }, 20, dp(120), m.widthPixels)
+            { mk.rangeW = it / m.widthPixels.toFloat(); syncRange(mk); save(true) }, 20, dp(120), m.widthPixels)
         stepper(col, "Y-axis range (px)", { (mk.rangeH * m.heightPixels).toInt() },
-            { mk.rangeH = it / m.heightPixels.toFloat(); syncRange(mk) }, 20, dp(120), m.heightPixels)
+            { mk.rangeH = it / m.heightPixels.toFloat(); syncRange(mk); save(true) }, 20, dp(120), m.heightPixels)
         col.addView(android.widget.Switch(this).apply {
             text = "Reset"; isChecked = mk.reset; setPadding(0, dp(8), 0, 0)
-            setOnCheckedChangeListener { _, c -> mk.reset = c }
+            setOnCheckedChangeListener { _, c -> mk.reset = c; save(true) }
         })
         col.addView(TextView(this).apply {
             text = "If enabled, turning never stops: when the mouse goes out of range the PC hands the camera over to a " +
@@ -673,10 +722,19 @@ class OverlayService : Service() {
         })
         col.addView(android.widget.Switch(this).apply {
             text = "Hide range box while playing"; isChecked = mk.hideBox; setPadding(0, dp(8), 0, 0)
-            setOnCheckedChangeListener { _, c -> mk.hideBox = c; applyMarkerState(mk) }
+            setOnCheckedChangeListener { _, c -> mk.hideBox = c; applyMarkerState(mk); save(true) }
         })
         col.addView(TextView(this).apply {
-            text = "The box stays visible in Edit mode so you can still resize it. Remember to Save."
+            text = "The box stays visible in Edit mode so you can still resize it."
+            textSize = 11f
+        })
+        col.addView(android.widget.Switch(this).apply {
+            text = "Crosshair at screen center"; isChecked = mk.centerCross; setPadding(0, dp(8), 0, 0)
+            setOnCheckedChangeListener { _, c -> mk.centerCross = c; applyMarkerState(mk); save(true) }
+        })
+        col.addView(TextView(this).apply {
+            text = "A fixed crosshair in the middle of the screen. The aim pad stays where it is, so you can still see " +
+                "where the camera finger touches and moves."
             textSize = 11f
         })
         opacityRow(col, mk)
@@ -694,7 +752,7 @@ class OverlayService : Service() {
 
     private fun file() = File(getExternalFilesDir(null), "keymap.json")
 
-    private fun save() {
+    private fun save(quiet: Boolean = false) {
         val m = real()
         val nodes = JSONArray()
         var aim: Marker? = null
@@ -722,20 +780,23 @@ class OverlayService : Service() {
             mm.put("startPos", pt(fx(aim, m.widthPixels), fy(aim, m.heightPixels)))
                 .put("speedRatio", JSONObject().put("x", r4(aim.sensX / 25.0)).put("y", r4(aim.sensY / 25.0)))
                 .put("range", JSONObject().put("w", r4(aim.rangeW)).put("h", r4(aim.rangeH)))
-                .put("reset", aim.reset).put("hideBox", aim.hideBox).put("alpha", r4(aim.alpha))
+                .put("reset", aim.reset).put("hideBox", aim.hideBox).put("centerCrosshair", aim.centerCross).put("alpha", r4(aim.alpha))
         } else {
             mm.put("startPos", pt(0.5f, 0.5f))
                 .put("speedRatio", JSONObject().put("x", 2.0).put("y", 2.0))
         }
         val root = JSONObject().put("switchKey", "Key_QuoteLeft").put("mouseMoveMap", mm).put("keyMapNodes", nodes)
+            .put("hideButtons", hideAll)
         file().writeText(root.toString(2))
-        Toast.makeText(this, "Saved ${file().absolutePath}", Toast.LENGTH_LONG).show()
+        if (!quiet) Toast.makeText(this, "Saved ${file().absolutePath}", Toast.LENGTH_LONG).show()
     }
 
     private fun loadExisting() {
         val f = file(); if (!f.exists()) return
         runCatching {
             val root = JSONObject(f.readText())
+            hideAll = root.optBoolean("hideButtons", false)
+            hideAllButton?.text = if (hideAll) "Show btns" else "Hide btns"
             val m = real()
             val arr = root.getJSONArray("keyMapNodes")
             for (i in 0 until arr.length()) {
@@ -768,6 +829,7 @@ class OverlayService : Service() {
                 mk.sensY = ((sr?.optDouble("y", 2.0) ?: 2.0) * 25).toInt()
                 mk.reset = mm.optBoolean("reset", true)
                 mk.hideBox = mm.optBoolean("hideBox", false)
+                mk.centerCross = mm.optBoolean("centerCrosshair", true)
                 mk.alpha = mm.optDouble("alpha", 0.6).toFloat().coerceIn(0.1f, 1f)
                 syncRange(mk); applyMarkerState(mk)
             }

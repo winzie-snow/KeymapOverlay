@@ -96,6 +96,17 @@ def parse_devices(text):
     return out
 
 
+def aim_from_json(mm):
+    """mouseMoveMap dict from keymap.json -> aim settings dict (or None when there is no aim marker)."""
+    if not mm or "range" not in mm:
+        return None
+    sr = mm.get("speedRatio", {})
+    return {"start": (mm["startPos"]["x"], mm["startPos"]["y"]),
+            "speed": (sr.get("x", 2.0), sr.get("y", 2.0)),
+            "range": (mm["range"]["w"], mm["range"]["h"]),
+            "reset": bool(mm.get("reset", True))}
+
+
 class TouchLink:
     """Sends touch events to the phone through the scrcpy server (control channel only, no video)."""
 
@@ -596,7 +607,12 @@ class App:
     def quick_start(self):
         self.grant()
         last = self.cfg.get("last_keymap")
-        if last and os.path.isfile(last):
+        rc, _ = self.run_adb(["shell", "ls", REMOTE_JSON])
+        if rc == 0:
+            # the phone already has a keymap (saved from the overlay): never overwrite it with the old PC copy,
+            # that silently reverted sensitivity / range / marker edits
+            self.say("Keeping the keymap that is already on the phone")
+        elif last and os.path.isfile(last):
             self.push(last)
         self.svc(None)
 
@@ -680,14 +696,7 @@ class App:
                                  "keys": [n["upKey"], n["leftKey"], n["downKey"], n["rightKey"]],
                                  "off": (n.get("rightOffset", 0.07), n.get("downOffset", 0.12))}
                         break
-                aim = None
-                mm = data.get("mouseMoveMap") or {}
-                if "range" in mm:
-                    sr = mm.get("speedRatio", {})
-                    aim = {"start": (mm["startPos"]["x"], mm["startPos"]["y"]),
-                           "speed": (sr.get("x", 2.0), sr.get("y", 2.0)),
-                           "range": (mm["range"]["w"], mm["range"]["h"]),
-                           "reset": bool(mm.get("reset", True))}
+                aim = aim_from_json(data.get("mouseMoveMap") or {})
                 return taps, aim, wheel
             except Exception:
                 continue
@@ -730,6 +739,41 @@ class App:
                 sx = sy = sens
                 xmin, xmax, ymin, ymax, reset = 0.05, 0.95, 0.05, 0.95, True
                 self.say("No aim marker in the keymap - using the Camera X,Y fields (add +Aim in the overlay)")
+            # live reload: while in cursor mode, re-read keymap.json from the phone every ~1.2 s, so sensitivity,
+            # range and aim point edited in the overlay apply immediately (no need to restart the capture)
+            live = {"aim": None, "ver": 0, "raw": None}
+            run_id = object()
+            self.cap_run = run_id
+            self.cap_mode = "cursor"
+
+            def watch_keymap():
+                tmp2 = os.path.join(BASE, "_keymap_live.json")
+                while self.capturing and self.cap_run is run_id:
+                    time.sleep(1.2)
+                    if self.cap_mode != "cursor":
+                        continue
+                    try:
+                        pr = subprocess.run([self.adb, "-s", serial, "pull", REMOTE_JSON, tmp2],
+                                            capture_output=True, timeout=8, creationflags=NOWIN)
+                        if pr.returncode != 0:
+                            continue
+                        with open(tmp2, "rb") as f:
+                            raw = f.read()
+                        if raw == live["raw"]:
+                            continue
+                        first = live["raw"] is None
+                        live["raw"] = raw
+                        if first:
+                            continue        # first read = what the capture already loaded
+                        a = aim_from_json(json.loads(raw.decode("utf-8")).get("mouseMoveMap") or {})
+                        if a:
+                            live["aim"] = a
+                            live["ver"] += 1
+                    except Exception:
+                        pass
+
+            threading.Thread(target=watch_keymap, daemon=True).start()
+            seen_ver = 0
             aim_vk = vk_for(AIM_KEY)     # ` (VK_OEM_3), fixed
             aim_name = key_label(AIM_KEY)
 
@@ -792,6 +836,16 @@ class App:
                 if pressed(0x1B):
                     break
                 now = time.time()
+                if live["ver"] != seen_ver:
+                    seen_ver = live["ver"]
+                    na = live["aim"]
+                    ax, ay = na["start"]
+                    sx = na["speed"][0] * sens / 2.0
+                    sy = na["speed"][1] * sens / 2.0
+                    xmin, xmax = max(0.0, ax - na["range"][0] / 2), min(1.0, ax + na["range"][0] / 2)
+                    ymin, ymax = max(0.0, ay - na["range"][1] / 2), min(1.0, ay + na["range"][1] / 2)
+                    reset = na["reset"]
+                    self.say(f"Aim settings updated from the phone (speed {na['speed'][0]:.2f} / {na['speed'][1]:.2f})")
                 hot = pressed(aim_vk)
                 if hot and not prev_hot:
                     if mode == "cursor":
@@ -799,6 +853,7 @@ class App:
                             link.send(1, 4, curx, cury, w, h, 0)
                             cur_down = False
                         mode = "game"
+                        self.cap_mode = mode
                         ov.send("H")
                         enter_game()
                     else:
@@ -807,6 +862,7 @@ class App:
                             down = False
                         release_game()
                         mode = "cursor"
+                        self.cap_mode = mode
                         prev_lm = pressed(1)
                         dirty = True
                     self.q.put(("capmode", (mode, aim_name)))
