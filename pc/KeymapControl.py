@@ -17,6 +17,9 @@ MODE_TEXT = {
     "game": "AIM MODE - mouse moves the camera, keys and buttons are active\nPress {k} to bring back the cursor  |  Esc = release",
 }
 MODE_BG = {"cursor": "#0d47a1", "game": "#1b5e20"}
+AIM_KEY = "Key_QuoteLeft"   # the ` key on the PC always toggles cursor <-> aim mode
+JOY_SLIDE = 0.07            # seconds for the direction finger to slide from the centre to the rim
+JOY_STEP = 0.006            # minimum seconds between two direction move events
 SERVER_VER = "5.0.1"
 SERVER_URL = f"https://github.com/Genymobile/scrcpy/releases/download/v{SERVER_VER}/scrcpy-server-v{SERVER_VER}"
 SERVER_JAR = os.path.join(BASE, "scrcpy-server.jar")
@@ -178,6 +181,67 @@ class TouchLink:
             except Exception:
                 pass
         self.sock = self.proc = self.port = None
+
+
+class JoySlide:
+    """Direction-pad finger that SLIDES between the centre and the rim instead of jumping.
+
+    Keys only change the target; the finger glides towards it. It is lifted only after it has glided
+    back to the centre, so W -> D (which passes through "no key" for a few ms) never lifts the finger.
+    update() returns the touch events to send as (action, x, y): 0 down, 2 move, 1 up."""
+
+    def __init__(self, cx, cy, rx, ry, slide=JOY_SLIDE, step=JOY_STEP):
+        self.cx, self.cy, self.rx, self.ry = cx, cy, rx, ry
+        self.slide, self.min_step = slide, step
+        self.on = False
+        self.fx = self.fy = 0.0      # finger offset in units of the radius (-1..1)
+        self.last = 0.0
+
+    @property
+    def pos(self):
+        return self.cx + self.fx * self.rx, self.cy + self.fy * self.ry
+
+    def update(self, vx, vy, now):
+        ev = []
+        if vx or vy:
+            n = math.hypot(vx, vy)
+            tx, ty = vx / n, vy / n
+            if not self.on:
+                self.on = True
+                self.fx = self.fy = 0.0
+                self.last = now
+                ev.append((0,) + self.pos)
+        else:
+            tx = ty = 0.0
+        if not self.on:
+            return ev
+        dt = now - self.last
+        if dt < self.min_step:
+            return ev
+        self.last = now
+        step = dt / self.slide
+        dx, dy = tx - self.fx, ty - self.fy
+        d = math.hypot(dx, dy)
+        if d > 1e-6:
+            if d <= step:
+                self.fx, self.fy = tx, ty
+            else:
+                self.fx += dx / d * step
+                self.fy += dy / d * step
+            ev.append((2,) + self.pos)
+        elif not (vx or vy):         # settled at the centre with no key held -> lift
+            self.on = False
+            ev.append((1,) + self.pos)
+        return ev
+
+    def release(self):
+        """Lift immediately (leaving game mode). Returns the up event or None."""
+        if not self.on:
+            return None
+        self.on = False
+        p = self.pos
+        self.fx = self.fy = 0.0
+        return (1,) + p
 
 
 class OverlayLink:
@@ -618,8 +682,7 @@ class App:
                     aim = {"start": (mm["startPos"]["x"], mm["startPos"]["y"]),
                            "speed": (sr.get("x", 2.0), sr.get("y", 2.0)),
                            "range": (mm["range"]["w"], mm["range"]["h"]),
-                           "reset": bool(mm.get("reset", True)),
-                           "key": mm.get("aimKey", "Key_QuoteLeft")}
+                           "reset": bool(mm.get("reset", True))}
                 return taps, aim, wheel
             except Exception:
                 continue
@@ -627,6 +690,10 @@ class App:
 
     def capture_run(self, serial, sens, ax, ay, landscape, rect):
         user32 = ctypes.windll.user32
+        try:
+            ctypes.windll.winmm.timeBeginPeriod(1)   # 1 ms timer so the loop ticks evenly
+        except Exception:
+            pass
         ov = None
         link = None
         try:
@@ -658,9 +725,8 @@ class App:
                 sx = sy = sens
                 xmin, xmax, ymin, ymax, reset = 0.05, 0.95, 0.05, 0.95, True
                 self.say("No aim marker in the keymap - using the Camera X,Y fields (add +Aim in the overlay)")
-            aim_key = aim["key"] if aim else "Key_QuoteLeft"
-            aim_vk = vk_for(aim_key) or 0xC0
-            aim_name = key_label(aim_key)
+            aim_vk = vk_for(AIM_KEY)     # ` (VK_OEM_3), fixed
+            aim_name = key_label(AIM_KEY)
 
             pressed = lambda vk: vk is not None and bool(user32.GetAsyncKeyState(vk) & 0x8000)
             binds = []
@@ -670,21 +736,26 @@ class App:
                     continue
                 binds.append({"vk": vk, "pid": 20 + i, "x": bx * w, "y": by * h, "down": False, "sent": False})
             wvk = [vk_for(k) for k in wheel["keys"]] if wheel else []
-            joy = {"dir": (0, 0), "x": 0.0, "y": 0.0}
+            joy = None
             if wheel:
-                jcx, jcy = wheel["center"][0] * w, wheel["center"][1] * h
-                jrx, jry = wheel["off"][0] * w, wheel["off"][1] * h
-            self.say(f"Screen {w}x{h}. Aim on/off key: {aim_name}. Tap markers: {len(binds)}. "
-                     f"Direction pad: {'yes' if wheel else 'no'}")
+                joy = JoySlide(wheel["center"][0] * w, wheel["center"][1] * h,
+                               wheel["off"][0] * w, wheel["off"][1] * h)
+            self.say(f"Screen {w}x{h}. Press {aim_name} to switch cursor/aim. Tap markers: {len(binds)}. "
+                     f"Direction pad: {'yes' if wheel else 'no'}. Aim marker: {'yes' if aim else 'no'}")
+
+            def send_joy(events):
+                for act, jx, jy in events:
+                    link.send(act, 8, jx, jy, w, h, 0 if act == 1 else 0xFFFF)
 
             def release_game():
                 for bd in binds:
                     if bd["sent"]:
                         link.send(1, bd["pid"], bd["x"], bd["y"], w, h, 0)
                     bd["sent"] = False
-                if joy["dir"] != (0, 0):
-                    link.send(1, 8, joy["x"], joy["y"], w, h, 0)
-                joy["dir"] = (0, 0)
+                if joy:
+                    up = joy.release()
+                    if up:
+                        send_joy([up])
 
             def enter_game():
                 for bd in binds:
@@ -732,6 +803,7 @@ class App:
                         prev_lm = pressed(1)
                         dirty = True
                     self.q.put(("capmode", (mode, aim_name)))
+                    self.say("AIM mode ON" if mode == "game" else "Cursor mode ON")
                 prev_hot = hot
 
                 user32.GetCursorPos(ctypes.byref(pt))
@@ -792,19 +864,10 @@ class App:
                             elif bd["sent"]:
                                 link.send(1, bd["pid"], bd["x"], bd["y"], w, h, 0)
                                 bd["sent"] = False
-                    if wheel:
+                    if joy:
                         vx = int(pressed(wvk[3])) - int(pressed(wvk[1]))
                         vy = int(pressed(wvk[2])) - int(pressed(wvk[0]))
-                        if (vx, vy) != joy["dir"]:
-                            if vx or vy:
-                                n = math.hypot(vx, vy)
-                                joy["x"], joy["y"] = jcx + vx / n * jrx, jcy + vy / n * jry
-                                if joy["dir"] == (0, 0):
-                                    link.send(0, 8, jcx, jcy, w, h)
-                                link.send(2, 8, joy["x"], joy["y"], w, h)
-                            else:
-                                link.send(1, 8, joy["x"], joy["y"], w, h, 0)
-                            joy["dir"] = (vx, vy)
+                        send_joy(joy.update(vx, vy, now))
                 time.sleep(0.002)
 
             # release everything that is still down
@@ -819,6 +882,7 @@ class App:
         finally:
             try:
                 user32.ClipCursor(None)
+                ctypes.windll.winmm.timeEndPeriod(1)
             except Exception:
                 pass
             if ov:

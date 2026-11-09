@@ -28,6 +28,7 @@ import android.view.WindowManager.LayoutParams as LP
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONArray
@@ -52,9 +53,11 @@ class OverlayService : Service() {
         var rangeW = 0.4f
         var rangeH = 0.6f
         var reset = true
-        var aimKey = "Key_QuoteLeft"
+        var alpha = 0.6f               // button opacity, 0.1 .. 1.0
         var rangeView: View? = null
         var rangeLp: LP? = null
+        var grip: View? = null         // drag handle used to resize the direction pad / aim range
+        var gripLp: LP? = null
     }
 
     // ---------- custom views ----------
@@ -101,6 +104,29 @@ class OverlayService : Service() {
             canvas.drawLine(cx - r, cy, cx + r, cy, ring)
             canvas.drawLine(cx, cy - r, cx, cy + r, ring)
             canvas.drawCircle(cx, cy, r * 0.28f, dot)
+        }
+    }
+
+    // little round handle with a diagonal double arrow; drag it to resize
+    private class GripView(c: Context) : View(c) {
+        private val bg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xEE263238.toInt(); style = Paint.Style.FILL }
+        private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = 4f }
+        private val ln = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = 5f; strokeCap = Paint.Cap.ROUND
+        }
+        override fun onDraw(canvas: Canvas) {
+            val cx = width / 2f
+            val cy = height / 2f
+            val r = minOf(cx, cy) - 3f
+            canvas.drawCircle(cx, cy, r, bg)
+            canvas.drawCircle(cx, cy, r, ring)
+            val a = r * 0.5f
+            val h = r * 0.28f
+            canvas.drawLine(cx - a, cy - a, cx + a, cy + a, ln)
+            canvas.drawLine(cx + a, cy + a, cx + a - h, cy + a, ln)
+            canvas.drawLine(cx + a, cy + a, cx + a, cy + a - h, ln)
+            canvas.drawLine(cx - a, cy - a, cx - a + h, cy - a, ln)
+            canvas.drawLine(cx - a, cy - a, cx - a, cy - a + h, ln)
         }
     }
 
@@ -269,12 +295,21 @@ class OverlayService : Service() {
         applyLock()
     }
 
-    private fun applyLock() {
-        markers.forEach {
-            it.lp.flags = if (locked) baseFlags() or LP.FLAG_NOT_TOUCHABLE else baseFlags()
-            it.view.alpha = if (locked) 0.35f else 0.85f
-            it.rangeView?.alpha = if (locked) 0.25f else 1f
-            wm.updateViewLayout(it.view, it.lp)
+    private fun applyLock() = markers.forEach { applyMarkerState(it) }
+
+    // lock state + opacity for one marker (also used right after a marker is created, so a RELOAD while
+    // locked never leaves touchable markers that would swallow the injected touches)
+    private fun applyMarkerState(mk: Marker) {
+        val flags = if (locked) baseFlags() or LP.FLAG_NOT_TOUCHABLE else baseFlags()
+        mk.lp.flags = flags
+        mk.view.alpha = mk.alpha
+        wm.updateViewLayout(mk.view, mk.lp)
+        mk.rangeView?.alpha = if (locked) mk.alpha * 0.4f else mk.alpha
+        mk.grip?.let { g ->
+            val gl = mk.gripLp ?: return@let
+            gl.flags = flags
+            g.visibility = if (locked) View.GONE else View.VISIBLE
+            wm.updateViewLayout(g, gl)
         }
     }
 
@@ -289,11 +324,10 @@ class OverlayService : Service() {
                 setTextColor(Color.WHITE); gravity = Gravity.CENTER; textSize = 12f
                 background = GradientDrawable().apply {
                     shape = GradientDrawable.OVAL
-                    setColor(0xAAE53935.toInt()); setStroke(3, Color.WHITE)
+                    setColor(0xFFE53935.toInt()); setStroke(3, Color.WHITE) // opaque: the opacity slider does the fading
                 }
             }
         }
-        view.alpha = 0.85f
         val lp = LP(sizePx, sizePx, LP.TYPE_APPLICATION_OVERLAY, baseFlags(), PixelFormat.TRANSLUCENT)
         lp.gravity = Gravity.TOP or Gravity.START
         lp.x = (fx * m.widthPixels - sizePx / 2).toInt()
@@ -318,7 +352,7 @@ class OverlayService : Service() {
                     if (moved) {
                         lp.x = sx + (e.rawX - dx).toInt(); lp.y = sy + (e.rawY - dy).toInt()
                         wm.updateViewLayout(view, lp)
-                        if (mk.type == "aim") syncRange(mk)
+                        if (mk.type == "aim") syncRange(mk) else syncGrip(mk)
                     }
                 }
                 MotionEvent.ACTION_UP -> if (!moved) editMarker(mk)
@@ -328,13 +362,68 @@ class OverlayService : Service() {
         wm.addView(view, lp)
         markers.add(mk)
         if (type == "wheel") refreshWheel(mk)
+        if (type == "wheel" || type == "aim") addGrip(mk)
         if (type == "aim") syncRange(mk)
+        applyMarkerState(mk)
         return mk
+    }
+
+    // ---------- resize handle (direction pad: whole pad, aim: the range rectangle) ----------
+    private fun addGrip(mk: Marker) {
+        val sz = dp(34)
+        val g = GripView(this)
+        val gl = LP(sz, sz, LP.TYPE_APPLICATION_OVERLAY, baseFlags(), PixelFormat.TRANSLUCENT)
+        gl.gravity = Gravity.TOP or Gravity.START
+        mk.grip = g; mk.gripLp = gl
+        var x0 = 0f; var y0 = 0f; var w0 = 0; var h0 = 0
+        g.setOnTouchListener { _, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    x0 = e.rawX; y0 = e.rawY
+                    if (mk.type == "aim") {
+                        val m = real(); w0 = (mk.rangeW * m.widthPixels).toInt(); h0 = (mk.rangeH * m.heightPixels).toInt()
+                    } else { w0 = mk.lp.width; h0 = w0 }
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = e.rawX - x0; val dy = e.rawY - y0
+                    if (mk.type == "aim") {
+                        // the range is centred on the aim marker, so the corner moves half as far as the size
+                        val m = real()
+                        mk.rangeW = ((w0 + 2 * dx).toInt().coerceIn(dp(120), m.widthPixels)) / m.widthPixels.toFloat()
+                        mk.rangeH = ((h0 + 2 * dy).toInt().coerceIn(dp(120), m.heightPixels)) / m.heightPixels.toFloat()
+                        syncRange(mk)
+                    } else {
+                        setWheelSize(mk, (w0 + dx + dy).toInt().coerceIn(dp(80), dp(320)))
+                    }
+                }
+            }
+            true
+        }
+        wm.addView(g, gl)
+        syncGrip(mk)
+    }
+
+    private fun syncGrip(mk: Marker) {
+        val g = mk.grip ?: return
+        val gl = mk.gripLp ?: return
+        if (mk.type == "aim") {
+            val rl = mk.rangeLp ?: return
+            gl.x = rl.x + rl.width - gl.width / 2          // bottom-right corner of the range rectangle
+            gl.y = rl.y + rl.height - gl.height / 2
+        } else {
+            val cx = mk.lp.x + mk.lp.width / 2
+            val cy = mk.lp.y + mk.lp.height / 2
+            val off = (mk.lp.width / 2 * 0.7071f).toInt()  // sits on the ring, bottom-right
+            gl.x = cx + off - gl.width / 2
+            gl.y = cy + off - gl.height / 2
+        }
+        wm.updateViewLayout(g, gl)
     }
 
     private fun removeMarker(mk: Marker) {
         runCatching { wm.removeView(mk.view) }
         mk.rangeView?.let { runCatching { wm.removeView(it) } }
+        mk.grip?.let { runCatching { wm.removeView(it) } }
         markers.remove(mk)
     }
 
@@ -344,11 +433,12 @@ class OverlayService : Service() {
         val m = real()
         val cx = mk.lp.x + mk.lp.width / 2
         val cy = mk.lp.y + mk.lp.height / 2
-        rl.width = (mk.rangeW * m.widthPixels).toInt().coerceAtLeast(dp(40))
-        rl.height = (mk.rangeH * m.heightPixels).toInt().coerceAtLeast(dp(40))
+        rl.width = (mk.rangeW * m.widthPixels).toInt().coerceAtLeast(dp(120))
+        rl.height = (mk.rangeH * m.heightPixels).toInt().coerceAtLeast(dp(120))
         rl.x = cx - rl.width / 2
         rl.y = cy - rl.height / 2
         wm.updateViewLayout(rv, rl)
+        syncGrip(mk)
     }
 
     private fun refreshWheel(mk: Marker) {
@@ -363,6 +453,7 @@ class OverlayService : Service() {
         mk.lp.width = px; mk.lp.height = px
         mk.lp.x = cx - px / 2; mk.lp.y = cy - px / 2
         wm.updateViewLayout(mk.view, mk.lp)
+        syncGrip(mk)
     }
 
     // ---------- key picker ----------
@@ -443,10 +534,48 @@ class OverlayService : Service() {
         when (mk.type) {
             "wheel" -> editWheel(mk, del)
             "aim" -> editAim(mk, del)
-            else -> pickKey("Pick the button for this marker", del) { code ->
-                mk.key = code; (mk.view as TextView).text = labelFor(code)
-            }
+            else -> editTap(mk, del)
         }
+    }
+
+    // opacity slider (10..100 %), applied live to the marker behind the dialog
+    private fun opacityRow(parent: LinearLayout, mk: Marker) {
+        val label = TextView(this).apply { setPadding(0, dp(12), 0, 0) }
+        fun show() { label.text = "Opacity: " + Math.round(mk.alpha * 100) + "%" }
+        show()
+        parent.addView(label)
+        parent.addView(SeekBar(this).apply {
+            max = 90
+            progress = Math.round(mk.alpha * 100) - 10
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                    mk.alpha = (p + 10) / 100f
+                    show()
+                    applyMarkerState(mk)
+                }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+            })
+        })
+    }
+
+    private fun editTap(mk: Marker, del: () -> Unit) {
+        var dlg: AlertDialog? = null
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 12, 24, 12) }
+        col.addView(Button(this).apply {
+            text = "Key: " + labelFor(mk.key); setAllCaps(false)
+            setOnClickListener {
+                dlg?.dismiss()
+                pickKey("Pick the button for this marker") { code ->
+                    mk.key = code; (mk.view as TextView).text = labelFor(code); editTap(mk, del)
+                }
+            }
+        })
+        opacityRow(col, mk)
+        val b = AlertDialog.Builder(this, theme()).setTitle("Tap button")
+            .setView(ScrollView(this).apply { addView(col) })
+            .setPositiveButton("Done", null).setNeutralButton("Delete") { _, _ -> del() }
+        dlg = overlayDialog(b)
     }
 
     private fun editWheel(mk: Marker, del: () -> Unit) {
@@ -478,7 +607,12 @@ class OverlayService : Service() {
             })
         }
         stepper(col, "Size (dp)", { (mk.lp.width / resources.displayMetrics.density).toInt() },
-            { setWheelSize(mk, dp(it)) }, 10, 80, 300)
+            { setWheelSize(mk, dp(it)) }, 10, 80, 320)
+        col.addView(TextView(this).apply {
+            text = "Tip: you can also drag the round handle on the pad to resize it."
+            textSize = 11f
+        })
+        opacityRow(col, mk)
         val b = AlertDialog.Builder(this, theme()).setTitle("Direction keys")
             .setView(ScrollView(this).apply { addView(col) })
             .setPositiveButton("Done", null).setNeutralButton("Delete") { _, _ -> del() }
@@ -487,25 +621,18 @@ class OverlayService : Service() {
 
     private fun editAim(mk: Marker, del: () -> Unit) {
         val m = real()
-        var dlg: AlertDialog? = null
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 12, 24, 12) }
-        col.addView(Button(this).apply {
-            text = "Aim on/off key: " + labelFor(mk.aimKey); setAllCaps(false)
-            setOnClickListener {
-                dlg?.dismiss()
-                pickKey("Key that toggles aim mode") { code -> mk.aimKey = code; editAim(mk, del) }
-            }
-        })
         col.addView(TextView(this).apply {
-            text = "Press it on the PC to switch between the cursor and aim mode."
+            text = "On the PC, press ` to switch between cursor and aim mode. " +
+                "Drag the round handle on the range box to resize it."
             textSize = 11f; setPadding(0, 0, 0, dp(8))
         })
         stepper(col, "X-axis sensitivity", { mk.sensX }, { mk.sensX = it }, 5, 5, 200)
         stepper(col, "Y-axis sensitivity", { mk.sensY }, { mk.sensY = it }, 5, 5, 200)
         stepper(col, "X-axis range (px)", { (mk.rangeW * m.widthPixels).toInt() },
-            { mk.rangeW = it / m.widthPixels.toFloat(); syncRange(mk) }, 20, 100, m.widthPixels)
+            { mk.rangeW = it / m.widthPixels.toFloat(); syncRange(mk) }, 20, dp(120), m.widthPixels)
         stepper(col, "Y-axis range (px)", { (mk.rangeH * m.heightPixels).toInt() },
-            { mk.rangeH = it / m.heightPixels.toFloat(); syncRange(mk) }, 20, 100, m.heightPixels)
+            { mk.rangeH = it / m.heightPixels.toFloat(); syncRange(mk) }, 20, dp(120), m.heightPixels)
         col.addView(android.widget.Switch(this).apply {
             text = "Reset"; isChecked = mk.reset; setPadding(0, dp(8), 0, 0)
             setOnCheckedChangeListener { _, c -> mk.reset = c }
@@ -514,10 +641,11 @@ class OverlayService : Service() {
             text = "If enabled, the camera finger lifts and restarts at the center when the mouse moves out of range."
             textSize = 11f
         })
-        val b = AlertDialog.Builder(this, theme()).setTitle("Aim key settings")
+        opacityRow(col, mk)
+        val b = AlertDialog.Builder(this, theme()).setTitle("Aim settings")
             .setView(ScrollView(this).apply { addView(col) })
             .setPositiveButton("Done", null).setNeutralButton("Delete") { _, _ -> del() }
-        dlg = overlayDialog(b)
+        overlayDialog(b)
     }
 
     // ---------- save / load ----------
@@ -543,11 +671,12 @@ class OverlayService : Service() {
                     nodes.put(JSONObject().put("type", "KMT_STEER_WHEEL").put("centerPos", pt(x, y))
                         .put("upKey", mk.wheel[0]).put("leftKey", mk.wheel[1])
                         .put("downKey", mk.wheel[2]).put("rightKey", mk.wheel[3])
-                        .put("leftOffset", ox).put("rightOffset", ox).put("upOffset", oy).put("downOffset", oy))
+                        .put("leftOffset", ox).put("rightOffset", ox).put("upOffset", oy).put("downOffset", oy)
+                        .put("alpha", r4(mk.alpha)))
                 }
                 "aim" -> aim = mk
                 else -> nodes.put(JSONObject().put("type", "KMT_CLICK").put("key", mk.key)
-                    .put("pos", pt(x, y)).put("switchMap", false))
+                    .put("pos", pt(x, y)).put("switchMap", false).put("alpha", r4(mk.alpha)))
             }
         }
         val mm = JSONObject()
@@ -555,7 +684,7 @@ class OverlayService : Service() {
             mm.put("startPos", pt(fx(aim, m.widthPixels), fy(aim, m.heightPixels)))
                 .put("speedRatio", JSONObject().put("x", r4(aim.sensX / 25.0)).put("y", r4(aim.sensY / 25.0)))
                 .put("range", JSONObject().put("w", r4(aim.rangeW)).put("h", r4(aim.rangeH)))
-                .put("reset", aim.reset).put("aimKey", aim.aimKey)
+                .put("reset", aim.reset).put("alpha", r4(aim.alpha))
         } else {
             mm.put("startPos", pt(0.5f, 0.5f))
                 .put("speedRatio", JSONObject().put("x", 2.0).put("y", 2.0))
@@ -576,14 +705,17 @@ class OverlayService : Service() {
                 if (n.getString("type") == "KMT_STEER_WHEEL") {
                     val c = n.getJSONObject("centerPos")
                     val rad = n.optDouble("rightOffset", 0.07) * m.widthPixels
-                    val sz = (rad * 2).toInt().coerceIn(dp(80), dp(260))
+                    val sz = (rad * 2).toInt().coerceIn(dp(80), dp(320))
                     val mk = addMarker("wheel", "", c.getDouble("x").toFloat(), c.getDouble("y").toFloat(), sz)
                     mk.wheel = mutableListOf(n.getString("upKey"), n.getString("leftKey"),
                         n.getString("downKey"), n.getString("rightKey"))
-                    refreshWheel(mk)
+                    mk.alpha = n.optDouble("alpha", 0.6).toFloat().coerceIn(0.1f, 1f)
+                    refreshWheel(mk); applyMarkerState(mk)
                 } else if (n.getString("type") == "KMT_CLICK") {
                     val p = n.getJSONObject("pos")
-                    addMarker("click", n.getString("key"), p.getDouble("x").toFloat(), p.getDouble("y").toFloat())
+                    val mk = addMarker("click", n.getString("key"), p.getDouble("x").toFloat(), p.getDouble("y").toFloat())
+                    mk.alpha = n.optDouble("alpha", 0.6).toFloat().coerceIn(0.1f, 1f)
+                    applyMarkerState(mk)
                 }
             }
             val mm = root.optJSONObject("mouseMoveMap")
@@ -597,8 +729,8 @@ class OverlayService : Service() {
                 mk.sensX = ((sr?.optDouble("x", 2.0) ?: 2.0) * 25).toInt()
                 mk.sensY = ((sr?.optDouble("y", 2.0) ?: 2.0) * 25).toInt()
                 mk.reset = mm.optBoolean("reset", true)
-                mk.aimKey = mm.optString("aimKey", "Key_QuoteLeft")
-                syncRange(mk)
+                mk.alpha = mm.optDouble("alpha", 0.6).toFloat().coerceIn(0.1f, 1f)
+                syncRange(mk); applyMarkerState(mk)
             }
         }
     }
