@@ -856,12 +856,18 @@ class App:
                                 link.send(1, 1, camx, camy, w, h, 0)
                                 down = False
                                 gap_until = now + AIM_GAP
+                                ov.send("H")
                         elif now - down_time >= AIM_SETTLE:
                             link.send(2, 1, camx, camy, w, h)
                         last_move = now
+                        if down and now - last_sent >= 0.016:
+                            # debug aid: the phone shows the cursor arrow exactly where the camera finger is
+                            ov.send(f"P {camx / w:.4f} {camy / h:.4f}")
+                            last_sent = now
                     elif down and now - last_move > AIM_IDLE:
                         link.send(1, 1, camx, camy, w, h, 0)
                         down = False
+                        ov.send("H")
                     for bd in binds:
                         st = pressed(bd["vk"])
                         if st != bd["down"]:
