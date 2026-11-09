@@ -53,6 +53,7 @@ class OverlayService : Service() {
         var rangeW = 0.4f
         var rangeH = 0.6f
         var reset = true
+        var hideBox = false            // hide the range box while locked (playing)
         var alpha = 0.6f               // button opacity, 0.1 .. 1.0
         var rangeView: View? = null
         var rangeLp: LP? = null
@@ -321,6 +322,7 @@ class OverlayService : Service() {
         mk.view.alpha = mk.alpha
         wm.updateViewLayout(mk.view, mk.lp)
         mk.rangeView?.alpha = if (locked) mk.alpha * 0.4f else mk.alpha
+        mk.rangeView?.visibility = if (locked && mk.hideBox) View.GONE else View.VISIBLE
         (mk.view as? AimView)?.crosshairOnly = locked
         if (mk.type == "aim") {
             // while playing, keep every aim window at <= 0.75 window opacity: Android 12+ blocks touches that
@@ -665,7 +667,16 @@ class OverlayService : Service() {
             setOnCheckedChangeListener { _, c -> mk.reset = c }
         })
         col.addView(TextView(this).apply {
-            text = "If enabled, the camera finger lifts and restarts at the center when the mouse moves out of range."
+            text = "If enabled, turning never stops: when the mouse goes out of range the PC hands the camera over to a " +
+                "fresh finger at the center (see AIM_HANDOFF in KeymapControl.py)."
+            textSize = 11f
+        })
+        col.addView(android.widget.Switch(this).apply {
+            text = "Hide range box while playing"; isChecked = mk.hideBox; setPadding(0, dp(8), 0, 0)
+            setOnCheckedChangeListener { _, c -> mk.hideBox = c; applyMarkerState(mk) }
+        })
+        col.addView(TextView(this).apply {
+            text = "The box stays visible in Edit mode so you can still resize it. Remember to Save."
             textSize = 11f
         })
         opacityRow(col, mk)
@@ -711,7 +722,7 @@ class OverlayService : Service() {
             mm.put("startPos", pt(fx(aim, m.widthPixels), fy(aim, m.heightPixels)))
                 .put("speedRatio", JSONObject().put("x", r4(aim.sensX / 25.0)).put("y", r4(aim.sensY / 25.0)))
                 .put("range", JSONObject().put("w", r4(aim.rangeW)).put("h", r4(aim.rangeH)))
-                .put("reset", aim.reset).put("alpha", r4(aim.alpha))
+                .put("reset", aim.reset).put("hideBox", aim.hideBox).put("alpha", r4(aim.alpha))
         } else {
             mm.put("startPos", pt(0.5f, 0.5f))
                 .put("speedRatio", JSONObject().put("x", 2.0).put("y", 2.0))
@@ -756,6 +767,7 @@ class OverlayService : Service() {
                 mk.sensX = ((sr?.optDouble("x", 2.0) ?: 2.0) * 25).toInt()
                 mk.sensY = ((sr?.optDouble("y", 2.0) ?: 2.0) * 25).toInt()
                 mk.reset = mm.optBoolean("reset", true)
+                mk.hideBox = mm.optBoolean("hideBox", false)
                 mk.alpha = mm.optDouble("alpha", 0.6).toFloat().coerceIn(0.1f, 1f)
                 syncRange(mk); applyMarkerState(mk)
             }

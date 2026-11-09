@@ -21,6 +21,9 @@ AIM_KEY = "Key_QuoteLeft"   # the ` key on the PC always toggles cursor <-> aim 
 JOY_SLIDE = 0.07            # seconds for the direction finger to slide from the centre to the rim
 AIM_GAP = 0.03              # seconds the camera finger stays lifted when it hits the range edge
 AIM_SETTLE = 0.012          # seconds after touch-down before the camera finger starts moving
+AIM_HANDOFF = True          # endless smooth turning: at the range edge a 2nd finger lands at the aim point BEFORE the
+                            # 1st lifts (no gap, no jump). Set False to go back to lift / wait / re-press.
+AIM_OVERLAP = 0.006         # seconds both camera fingers are down during a handoff
 JOY_STEP = 0.006           # minimum seconds between two direction move events
 SERVER_VER = "5.0.1"
 SERVER_URL = f"https://github.com/Genymobile/scrcpy/releases/download/v{SERVER_VER}/scrcpy-server-v{SERVER_VER}"
@@ -777,6 +780,7 @@ class App:
             cur_down = False                         # cursor-mode finger is down
             prev_lm = pressed(1)
             camx = camy = 0.0
+            cam_pid = 1                              # camera finger id; alternates 1 <-> 2 on a handoff
             down = False                             # aim-mode camera finger is down
             last_move = last_sent = 0.0
             gap_until = down_time = 0.0              # aim finger: re-touch gap after a range reset / settle time
@@ -799,7 +803,7 @@ class App:
                         enter_game()
                     else:
                         if down:
-                            link.send(1, 1, camx, camy, w, h, 0)
+                            link.send(1, cam_pid, camx, camy, w, h, 0)
                             down = False
                         release_game()
                         mode = "cursor"
@@ -841,29 +845,34 @@ class App:
                     # moving the mouse just slides it (like keeping a finger pressed on the screen)
                     if not down and now >= gap_until:
                         camx, camy = ax * w, ay * h
-                        link.send(0, 1, camx, camy, w, h)
+                        link.send(0, cam_pid, camx, camy, w, h)
                         down = True
                         down_time = now
-                        ov.send(f"P {camx / w:.4f} {camy / h:.4f}")
                     if moved and down:
                         camx += dx * sx
                         camy += dy * sy
                         if not (xmin * w <= camx <= xmax * w and ymin * h <= camy <= ymax * h):
                             camx = min(max(camx, xmin * w), xmax * w)
                             camy = min(max(camy, ymin * h), ymax * h)
-                            link.send(2, 1, camx, camy, w, h)
+                            link.send(2, cam_pid, camx, camy, w, h)
                             if reset:
-                                # lift at the edge; the finger is pressed again at the aim point after a short gap,
-                                # so the game sees a clean new drag instead of a huge jump back to the centre
-                                link.send(1, 1, camx, camy, w, h, 0)
-                                down = False
-                                gap_until = now + AIM_GAP
+                                if AIM_HANDOFF:
+                                    # endless smooth turning: a fresh finger lands at the aim point while the old one
+                                    # is still down, then the old one lifts. The camera never stops being touched.
+                                    new_pid = 2 if cam_pid == 1 else 1
+                                    link.send(0, new_pid, ax * w, ay * h, w, h)
+                                    time.sleep(AIM_OVERLAP)
+                                    link.send(1, cam_pid, camx, camy, w, h, 0)
+                                    cam_pid = new_pid
+                                    camx, camy = ax * w, ay * h
+                                    down_time = now
+                                else:
+                                    # lift at the edge; pressed again at the aim point after a short gap
+                                    link.send(1, cam_pid, camx, camy, w, h, 0)
+                                    down = False
+                                    gap_until = now + AIM_GAP
                         elif now - down_time >= AIM_SETTLE:
-                            link.send(2, 1, camx, camy, w, h)
-                        if down and now - last_sent >= 0.016:
-                            # debug aid: the phone shows the cursor arrow exactly where the camera finger is
-                            ov.send(f"P {camx / w:.4f} {camy / h:.4f}")
-                            last_sent = now
+                            link.send(2, cam_pid, camx, camy, w, h)
                     for bd in binds:
                         st = pressed(bd["vk"])
                         if st != bd["down"]:
@@ -882,7 +891,7 @@ class App:
 
             # release everything that is still down
             if down:
-                link.send(1, 1, camx, camy, w, h, 0)
+                link.send(1, cam_pid, camx, camy, w, h, 0)
             if cur_down:
                 link.send(1, 4, curx, cury, w, h, 0)
             if mode == "game":
